@@ -45,6 +45,8 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_TOKEN, ALLOWED_USER_IDS, BASE_DIR
+from webhook_server import run_webhook_server
+from imap_watcher import run_imap_watcher
 from engines import (
     SUPPORTED_ENGINES,
     Engine,
@@ -337,6 +339,38 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_reminders_due "
             "ON reminders(enabled, next_fire_at)"
+        )
+        # imap_state: UIDs уже отправленных нотисов, чтобы не дублировать.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS imap_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                seen_at TEXT NOT NULL,
+                UNIQUE(account, uid)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_imap_state_account "
+            "ON imap_state(account, uid)"
+        )
+        # webhook_log: входящие события от Битрикс24 и других вебхуков.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS webhook_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                event TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                received_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_webhook_log_received "
+            "ON webhook_log(source, received_at)"
         )
 
 
@@ -3137,6 +3171,18 @@ async def _post_init(application: Application) -> None:
     # Reminders: cron-light напоминания для Менеджера.
     reminders_task = asyncio.create_task(reminders_worker(application))
     application.bot_data["reminders_worker_task"] = reminders_task
+
+    # Общий callback для отправки нотисов в топик Менеджера.
+    async def _notice(text: str, kind: str = "job_notification") -> None:
+        await _send_manager_notice(application, text, kind)
+
+    # Webhook-сервер для входящих событий Битрикс24.
+    webhook_task = asyncio.create_task(run_webhook_server(_notice))
+    application.bot_data["webhook_task"] = webhook_task
+
+    # IMAP-поллер для новых писем.
+    imap_task = asyncio.create_task(run_imap_watcher(_notice))
+    application.bot_data["imap_task"] = imap_task
 
 
 def main() -> None:
