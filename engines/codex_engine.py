@@ -222,6 +222,14 @@ class CodexEngine:
             effective_cwd, len(prompt), spawn_id,
         )
 
+        if effective_cwd and not os.path.isdir(effective_cwd):
+            return (
+                False,
+                f"⚠️ Рабочая папка `{effective_cwd}` не существует. "
+                "Создай её или переназначь через /bind.",
+                session_id, None,
+            )
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
