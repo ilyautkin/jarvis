@@ -1512,6 +1512,37 @@ async def call_llm_stream(
         spawn_procs=spawn_procs,
         spawn_id=spawn_id,
     )
+    # Recovery: иногда opencode/codex на resume могут вернуть rc=0, но пустой
+    # текст. Для постоянной сессии делаем один автоповтор в новой сессии.
+    if (
+        spawn_id is None
+        and (not ok)
+        and engine.name in {"opencode", "codex"}
+        and "вернул пустой ответ" in (final_text or "")
+    ):
+        try:
+            new_sid, _, _ = reset_session(key[0], key[1])
+            logger.warning(
+                "engine=%s empty reply on session=%s key=%s; retrying with new session=%s",
+                engine.name, session_id, key, new_sid,
+            )
+            ok2, final_text2, sid_after2, actual_model2 = await engine.call_stream(
+                session_id=new_sid,
+                prompt=prompt,
+                key=key,
+                cwd=cwd,
+                on_intermediate=on_intermediate,
+                active_procs=active_procs,
+                spawn_procs=spawn_procs,
+                spawn_id=spawn_id,
+            )
+            ok, final_text, sid_after, actual_model = ok2, final_text2, sid_after2, actual_model2
+            session_id = new_sid
+        except Exception:
+            logger.exception(
+                "recovery retry failed after empty reply: engine=%s key=%s",
+                engine.name, key,
+            )
     # Для постоянной сессии (не spawn) — если движок отдал новый id, сохраняем.
     if spawn_id is None and sid_after and sid_after != session_id:
         try:
@@ -2480,7 +2511,11 @@ async def _process_prompt(
 
         if not ok and not final_text.strip():
             logger.info("llm call stopped without final reply: key=%s engine=%s", key, engine.name)
-            return
+            final_text = (
+                f"{engine.name} не прислал финальный ответ "
+                "(процесс завершился без текста). "
+                "Попробуй /new для новой сессии или переключи движок через /engine."
+            )
 
         # Извлекаем маркеры файлов и отправляем их отдельными документами.
         cleaned_text, file_markers = extract_file_markers(final_text)
@@ -2599,7 +2634,7 @@ async def _run_spawn(update: Update, user_text: str) -> None:
                 key, spawn_id, ok, len(file_markers))
 
 
-async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | None]:
+async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | None, str | None]:
     """Drive a single queued job through the normal LLM pipeline.
 
     No Update object: the prompt is treated as user input but sourced from the
@@ -2619,7 +2654,7 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
         chat = await bot.get_chat(chat_id)
     except Exception:
         logger.exception("manager job %s: bot.get_chat(%s) failed", job_id, chat_id)
-        return False, None
+        return False, None, "failed to resolve target chat via Telegram API"
 
     lock = _lock_for(key)
     await lock.acquire()
@@ -2825,11 +2860,15 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
                 kind="job_interrupted",
             )
             logger.info("manager job %s: interrupted by manager", job_id)
-            return False, None
+            return False, None, "interrupted by manager request"
 
         if not ok and not final_text.strip():
             logger.info("manager job %s stopped without final reply", job_id)
-            return False, None
+            final_text = (
+                f"{engine.name} не прислал финальный ответ "
+                "(процесс завершился без текста). "
+                "Рекомендуется запустить /new в этом топике и повторить задачу."
+            )
 
         cleaned_text, file_markers = extract_file_markers(final_text)
         if not cleaned_text.strip():
@@ -2870,7 +2909,8 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
 
         logger.info("manager job %s done: ok=%s files=%d engine=%s",
                     job_id, ok, len(file_markers), engine.name)
-        return ok, sent_msg_id
+        err_text = None if ok else (cleaned_text[:1000] if cleaned_text else "engine returned no usable reply")
+        return ok, sent_msg_id, err_text
     finally:
         try:
             lock.release()
@@ -2992,10 +3032,10 @@ async def jobs_worker(app: Application) -> None:
                 await asyncio.sleep(2.0)
                 continue
             try:
-                ok, msg_id = await _run_manager_job(app, job)
+                ok, msg_id, err_text = await _run_manager_job(app, job)
                 finish_job(
                     job["id"], "done" if ok else "failed",
-                    None if ok else "engine returned no usable reply",
+                    None if ok else (err_text or "engine returned no usable reply"),
                     msg_id,
                 )
             except Exception as exc:
