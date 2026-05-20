@@ -71,6 +71,33 @@ def _is_placeholder(session_id: str) -> bool:
     return session_id.startswith(_PLACEHOLDER_PREFIX)
 
 
+def _playwright_config_overrides(mcp_playwright: bool) -> list[str]:
+    """``-c mcp_servers.<name>.*`` оверрайды для codex, если браузер запрошен.
+
+    Значения сериализуем через json.dumps — codex парсит value как TOML/JSON,
+    так что строки получают кавычки, а args — валидный массив. Пустой список,
+    если браузер не нужен или Playwright глобально выключен.
+    ПРИМЕЧАНИЕ: парсинг -c с массивом стоит проверить на конкретной версии
+    codex (см. README — фолбэк через ручную регистрацию в config.toml).
+    """
+    if not mcp_playwright:
+        return []
+    from engines.playwright_mcp import playwright_command_args, playwright_server_name
+
+    spec = playwright_command_args()
+    if spec is None:
+        logger.warning("mcp_playwright requested but Playwright globally disabled")
+        return []
+    npx, args = spec
+    name = playwright_server_name()
+    table = f"mcp_servers.{name}"
+    return [
+        "-c", f"{table}.command={json.dumps(npx, ensure_ascii=False)}",
+        "-c", f"{table}.args={json.dumps(args, ensure_ascii=False)}",
+        "-c", f"{table}.enabled=true",
+    ]
+
+
 def _codex_sessions_root() -> Path:
     return Path.home() / ".codex" / "sessions"
 
@@ -159,13 +186,12 @@ class CodexEngine:
         active_procs: dict,
         spawn_procs: dict,
         spawn_id: str | None = None,
+        system_prefix: str | None = None,
+        mcp_playwright: bool = False,
     ) -> tuple[bool, str, str | None]:
         effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
 
         is_spawn = spawn_id is not None
-
-        # Собираем итоговый prompt: префикс с инструкцией про [[FILE:]] + сам prompt.
-        full_prompt = FILE_MARKER_SYSTEM + "\n\n" + prompt
 
         # Решаем: новая сессия или resume.
         resume_mode = (
@@ -173,6 +199,15 @@ class CodexEngine:
             and not _is_placeholder(session_id)
             and self.session_exists(session_id, effective_cwd)
         )
+
+        # У codex нет канала system-prompt. FILE-маркер клеим каждый ход
+        # (он нужен и в середине сессии). Общий [SYSTEM:]-блок — только на
+        # НОВОЙ сессии: на resume он уже в транскрипте, повтор = лишние токены.
+        prefix_parts: list[str] = []
+        if system_prefix and not resume_mode:
+            prefix_parts.append(system_prefix)
+        prefix_parts.append(FILE_MARKER_SYSTEM)
+        full_prompt = "\n\n".join(prefix_parts) + "\n\n" + prompt
 
         # ВАЖНО: у `codex exec` и `codex exec resume` разный набор флагов.
         #   exec принимает: --sandbox, --dangerously-bypass-approvals-and-sandbox,
@@ -188,6 +223,9 @@ class CodexEngine:
             "--skip-git-repo-check",
             "--dangerously-bypass-approvals-and-sandbox",
         ]
+        # Playwright on-demand: -c оверрайды поверх config.toml (Manager MCP
+        # остаётся глобальным в config.toml). Без флага браузер не грузится.
+        shared_flags.extend(_playwright_config_overrides(mcp_playwright))
         if is_spawn:
             # Одноразовая параллельная сессия: не хотим, чтобы codex её сохранял
             # и потом мешался в списке recent-sessions.

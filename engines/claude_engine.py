@@ -50,6 +50,33 @@ def _sessions_dir_for(cwd: str) -> Path:
     return Path.home() / ".claude" / "projects" / encoded
 
 
+def _playwright_mcp_flags(mcp_playwright: bool) -> list[str]:
+    """``--mcp-config <inline-json>`` для Playwright, если браузер запрошен.
+
+    Без ``--strict-mcp-config`` — конфиг аддитивен к глобальному Manager MCP.
+    Пустой список, если браузер не нужен или Playwright глобально выключен.
+    """
+    if not mcp_playwright:
+        return []
+    from engines.playwright_mcp import playwright_command_args, playwright_server_name
+
+    spec = playwright_command_args()
+    if spec is None:
+        logger.warning("mcp_playwright requested but Playwright globally disabled")
+        return []
+    npx, args = spec
+    config = {
+        "mcpServers": {
+            playwright_server_name(): {
+                "type": "stdio",
+                "command": npx,
+                "args": args,
+            }
+        }
+    }
+    return ["--mcp-config", json.dumps(config, ensure_ascii=False)]
+
+
 class ClaudeEngine:
     name = "claude"
     bin_path = CLAUDE_BIN
@@ -117,6 +144,8 @@ class ClaudeEngine:
         active_procs: dict,
         spawn_procs: dict,
         spawn_id: str | None = None,
+        system_prefix: str | None = None,
+        mcp_playwright: bool = False,
     ) -> tuple[bool, str, str | None]:
         # cwd берётся из аргумента (если None — caller должен подставить default).
         effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
@@ -136,13 +165,25 @@ class ClaudeEngine:
         model = CURRENT_MODEL.get() or os.environ.get("CLAUDE_MODEL")
         model_flags = ["--model", model] if model else []
 
+        # Системный канал claude: FILE-маркер + (опц.) общий [SYSTEM:]-блок.
+        # Уходит как system-сообщение каждый ход — кешируется и НЕ копится в
+        # транскрипте (в отличие от старой схемы, где блок вшивался в prompt).
+        append_system = APPEND_SYSTEM_PROMPT
+        if system_prefix:
+            append_system = f"{system_prefix}\n\n{APPEND_SYSTEM_PROMPT}"
+
+        # Playwright — on-demand, инъекция per-invocation через --mcp-config
+        # (аддитивно к глобальному Manager MCP, без --strict-mcp-config).
+        mcp_flags = _playwright_mcp_flags(mcp_playwright)
+
         cmd = [
             CLAUDE_BIN, "--print",
             "--permission-mode", "bypassPermissions",
             "--input-format", "text",
             "--output-format", "stream-json",
             "--verbose",
-            "--append-system-prompt", APPEND_SYSTEM_PROMPT,
+            "--append-system-prompt", append_system,
+            *mcp_flags,
             *model_flags,
             *session_flags,
             prompt,

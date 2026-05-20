@@ -46,11 +46,24 @@ class Engine(Protocol):
         active_procs: dict,
         spawn_procs: dict,
         spawn_id: str | None = None,
+        system_prefix: str | None = None,
+        mcp_playwright: bool = False,
     ) -> tuple[bool, str, str | None, str | None]: ...
     # Возвращает (ok, final_text, session_id_after, actual_model).
     # actual_model — модель, которой CLI ответил последний раз (из stream
     # event'ов: 'system.init' у claude, 'turn.started' у codex, 'message'
     # у opencode). None если не удалось определить.
+    #
+    # system_prefix — постоянный [SYSTEM:]-блок (cwd + правила). Адаптер
+    #   размещает его в системном канале своего CLI: у claude —
+    #   --append-system-prompt (каждый ход, как system → кешируется, не копится
+    #   в транскрипте); у codex/opencode (нет system-канала) — префиксом к
+    #   prompt ТОЛЬКО на новой сессии (на resume он уже в транскрипте).
+    # mcp_playwright — если True, адаптер инъектит Playwright MCP per-invocation
+    #   (claude: --mcp-config; codex: -c оверрайды; opencode: OPENCODE_CONFIG
+    #   temp-файл). По умолчанию браузер НЕ грузится — это on-demand.
+    # Будущие движки ОБЯЗАНЫ реализовать оба контракта (см. README, раздел
+    # «Как подключить новый движок»).
 
 
 _CACHE: dict[str, Engine] = {}
@@ -98,16 +111,20 @@ def get_engine() -> Engine:
 def ensure_engine_tools(engine: Engine) -> tuple[bool, str]:
     """Runtime tool setup for an engine when Jarvis activates or uses it.
 
-    Registers all stdio MCP servers Jarvis exposes (Playwright + Manager).
-    Returns combined (ok, status); ok=False if any one server fails so the
-    caller can log it, but individual failures don't block the others.
+    Manager MCP is registered globally (always-on — cheap, every topic may
+    orchestrate). Playwright is NOT: it is on-demand and injected per
+    invocation by the adapter, so here we only strip any stale always-on
+    Playwright registration left by older Jarvis versions.
+
+    Returns combined (ok, status); ok=False if any step fails so the caller can
+    log it, but failures don't block the others.
     """
     from engines.jarvis_mcp import ensure_jarvis_mcp
-    from engines.playwright_mcp import ensure_playwright_mcp
+    from engines.playwright_mcp import disable_global_playwright_mcp
 
-    pw_ok, pw_status = ensure_playwright_mcp(engine.name, engine.bin_path)
     mgr_ok, mgr_status = ensure_jarvis_mcp(engine.name, engine.bin_path)
-    return pw_ok and mgr_ok, f"{pw_status}; {mgr_status}"
+    pw_ok, pw_status = disable_global_playwright_mcp(engine.name, engine.bin_path)
+    return mgr_ok and pw_ok, f"{mgr_status}; {pw_status}"
 
 
 @contextmanager

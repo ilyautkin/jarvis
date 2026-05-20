@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from contextvars import ContextVar
@@ -43,6 +44,68 @@ CURRENT_MODEL: ContextVar[str | None] = ContextVar("opencode_model", default=Non
 
 def _is_placeholder(session_id: str) -> bool:
     return session_id.startswith(_PLACEHOLDER_PREFIX)
+
+
+def _cleanup_tempfile(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _playwright_opencode_config(mcp_playwright: bool) -> str | None:
+    """Временный opencode-конфиг с добавленным Playwright MCP.
+
+    Клонирует глобальный opencode.json (Manager MCP и прочие настройки
+    сохраняются), добавляет playwright в `mcp` и пишет во временный файл.
+    Путь подставляется в OPENCODE_CONFIG для конкретного запуска. Возвращает
+    путь к temp-файлу или None (браузер не нужен / Playwright выключен).
+    Вызывающий обязан удалить файл через _cleanup_tempfile.
+    """
+    if not mcp_playwright:
+        return None
+    from engines.playwright_mcp import (
+        OPENCODE_CONFIG as BASE_CONFIG,
+        playwright_command_args,
+        playwright_server_name,
+    )
+
+    spec = playwright_command_args()
+    if spec is None:
+        logger.warning("mcp_playwright requested but Playwright globally disabled")
+        return None
+    npx, args = spec
+
+    base: Any = {}
+    if BASE_CONFIG.exists():
+        try:
+            base = json.loads(BASE_CONFIG.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logger.warning("cannot parse %s; starting opencode config from scratch", BASE_CONFIG)
+            base = {}
+    if not isinstance(base, dict):
+        base = {}
+    base.setdefault("$schema", "https://opencode.ai/config.json")
+    mcp = base.setdefault("mcp", {})
+    if not isinstance(mcp, dict):
+        mcp = {}
+        base["mcp"] = mcp
+    mcp[playwright_server_name()] = {
+        "type": "local",
+        "command": [npx, *args],
+        "enabled": True,
+    }
+
+    fd, path = tempfile.mkstemp(prefix="jarvis-opencode-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(base, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        _cleanup_tempfile(path)
+        raise
+    return path
 
 
 def _opencode_env() -> dict[str, str]:
@@ -172,12 +235,27 @@ class OpenCodeEngine:
         active_procs: dict,
         spawn_procs: dict,
         spawn_id: str | None = None,
+        system_prefix: str | None = None,
+        mcp_playwright: bool = False,
     ) -> tuple[bool, str, str | None]:
         effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
         is_spawn = spawn_id is not None
-        full_prompt = FILE_MARKER_SYSTEM + "\n\n" + prompt
 
         resume_mode = (not is_spawn) and self.session_exists(session_id, effective_cwd)
+
+        # У opencode нет канала system-prompt. FILE-маркер клеим каждый ход;
+        # общий [SYSTEM:]-блок — только на НОВОЙ сессии (на resume уже в
+        # транскрипте). См. codex-адаптер — логика идентична.
+        prefix_parts: list[str] = []
+        if system_prefix and not resume_mode:
+            prefix_parts.append(system_prefix)
+        prefix_parts.append(FILE_MARKER_SYSTEM)
+        full_prompt = "\n\n".join(prefix_parts) + "\n\n" + prompt
+
+        # Playwright on-demand: opencode run не умеет per-invocation MCP, поэтому
+        # клонируем глобальный конфиг (Manager MCP сохраняется) + добавляем
+        # playwright во временный файл и указываем на него через OPENCODE_CONFIG.
+        pw_config_path = _playwright_opencode_config(mcp_playwright)
 
         cmd = [
             OPENCODE_BIN, "run",
@@ -205,6 +283,7 @@ class OpenCodeEngine:
         )
 
         if effective_cwd and not os.path.isdir(effective_cwd):
+            _cleanup_tempfile(pw_config_path)
             return (
                 False,
                 f"⚠️ Рабочая папка `{effective_cwd}` не существует. "
@@ -212,17 +291,22 @@ class OpenCodeEngine:
                 session_id, None,
             )
 
+        env = _opencode_env()
+        if pw_config_path:
+            env["OPENCODE_CONFIG"] = pw_config_path
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=effective_cwd,
-                env=_opencode_env(),
+                env=env,
                 start_new_session=True,
                 limit=10 * 1024 * 1024,
             )
         except FileNotFoundError:
+            _cleanup_tempfile(pw_config_path)
             return False, f"`{OPENCODE_BIN}` не найден в PATH.", session_id, None
 
         if is_spawn:
@@ -371,6 +455,7 @@ class OpenCodeEngine:
             raise
         finally:
             await flush_intermediate(force=True)
+            _cleanup_tempfile(pw_config_path)
             if is_spawn:
                 skey = (key[0], key[1], spawn_id)
                 if spawn_procs.get(skey) is proc:

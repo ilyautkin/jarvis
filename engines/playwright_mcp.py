@@ -1,9 +1,20 @@
-"""Runtime Playwright MCP configuration for Jarvis engines.
+"""Playwright MCP wiring for Jarvis engines.
 
-Jarvis is not an MCP client itself. Browser tools are exposed by the selected
-CLI engine, so each engine must have the same Playwright MCP server configured.
-This module is called when an engine is activated or used; no manual setup step
-is required.
+Jarvis is not an MCP client itself — browser tools are exposed by the selected
+CLI engine. Unlike the Manager MCP (which every topic always gets), Playwright
+is **on-demand**: it is loaded only for topics that explicitly enabled browser
+mode (the ``mcp_playwright`` flag / ``/browser`` command). Loading ~30 browser
+tools into every prompt of every topic is pure token overhead otherwise.
+
+So this module no longer registers Playwright in the engines' global config.
+Instead it exposes :func:`playwright_command_args` — the single source of truth
+for the stdio server spec — which each engine adapter injects **per
+invocation** in its own CLI dialect (claude ``--mcp-config``, codex ``-c``
+overrides, opencode ``OPENCODE_CONFIG`` temp file).
+
+:func:`disable_global_playwright_mcp` cleans up any stale always-on Playwright
+registration left by older Jarvis versions, so the on-demand model is honoured
+even after an upgrade.
 """
 
 from __future__ import annotations
@@ -35,7 +46,8 @@ OPENCODE_CONFIG = Path(
 BEGIN_MARKER = "# BEGIN JARVIS PLAYWRIGHT MCP"
 END_MARKER = "# END JARVIS PLAYWRIGHT MCP"
 
-_STATUS: dict[str, tuple[bool, str]] = {}
+# Cache the cleanup result per engine for the current process (config touch once).
+_CLEANUP_STATUS: dict[str, tuple[bool, str]] = {}
 
 
 def _version_key(path: Path) -> tuple[int, ...]:
@@ -90,140 +102,114 @@ def _validate_server_name() -> None:
         raise RuntimeError("PLAYWRIGHT_MCP_NAME may contain only letters, digits, '_' and '-'")
 
 
-def _toml_string(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
+def playwright_enabled() -> bool:
+    """False if Playwright is globally disabled via JARVIS_PLAYWRIGHT_MCP."""
+    raw = os.environ.get("JARVIS_PLAYWRIGHT_MCP", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
-def _toml_array(values: list[str]) -> str:
-    return "[" + ", ".join(_toml_string(v) for v in values) + "]"
+def playwright_server_name() -> str:
+    return SERVER_NAME
 
 
-def _configure_codex(npx: str, args: list[str]) -> None:
-    table = f"mcp_servers.{SERVER_NAME}"
-    block = "\n".join(
-        [
-            BEGIN_MARKER,
-            f"[{table}]",
-            f"command = {_toml_string(npx)}",
-            f"args = {_toml_array(args)}",
-            "enabled = true",
-            "startup_timeout_sec = 30",
-            "tool_timeout_sec = 120",
-            END_MARKER,
-            "",
-        ]
-    )
+def playwright_command_args() -> tuple[str, list[str]] | None:
+    """``(npx_path, args)`` for the Playwright MCP stdio server.
 
-    old = CODEX_CONFIG.read_text(encoding="utf-8") if CODEX_CONFIG.exists() else ""
+    Single source of truth used by every engine adapter to inject Playwright
+    per invocation. Returns ``None`` when browser support is globally disabled
+    (``JARVIS_PLAYWRIGHT_MCP=0``). Raises if enabled but misconfigured (no npx,
+    bad args) so the caller can surface a clear error to the user.
+    """
+    if not playwright_enabled():
+        return None
+    _validate_server_name()
+    npx = _find_npx()
+    args = _playwright_args()
+    return npx, args
+
+
+# ---------------------------------------------------------------------------
+# Cleanup of stale always-on registration left by older Jarvis versions.
+# ---------------------------------------------------------------------------
+
+def _strip_managed_block(text: str) -> str:
     managed_re = re.compile(
-        rf"(?ms)^{re.escape(BEGIN_MARKER)}\n.*?^{re.escape(END_MARKER)}\n?"
+        rf"(?ms)\n*^{re.escape(BEGIN_MARKER)}\n.*?^{re.escape(END_MARKER)}\n?"
     )
+    return managed_re.sub("\n", text)
 
-    if managed_re.search(old):
-        new = managed_re.sub(block, old)
-    else:
-        table_re = re.compile(rf"(?ms)^\[{re.escape(table)}\]\n.*?(?=^\[|\Z)")
-        if table_re.search(old):
-            new = table_re.sub(block, old)
-        else:
-            new = old.rstrip() + ("\n\n" if old.strip() else "") + block
 
+def _disable_codex(npx: str | None = None) -> None:
+    if not CODEX_CONFIG.exists():
+        return
+    old = CODEX_CONFIG.read_text(encoding="utf-8")
+    new = _strip_managed_block(old)
+    # Also drop a plain [mcp_servers.playwright] table if it lingers.
+    table_re = re.compile(
+        rf"(?ms)^\[mcp_servers\.{re.escape(SERVER_NAME)}\]\n.*?(?=^\[|\Z)"
+    )
+    new = table_re.sub("", new)
     if new != old:
-        CODEX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
         CODEX_CONFIG.write_text(new, encoding="utf-8")
 
 
-def _configure_opencode(npx: str, args: list[str]) -> None:
-    if OPENCODE_CONFIG.exists():
-        try:
-            data = json.loads(OPENCODE_CONFIG.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Cannot parse {OPENCODE_CONFIG}: {exc}") from exc
-    else:
-        data = {"$schema": "https://opencode.ai/config.json"}
-
+def _disable_opencode() -> None:
+    if not OPENCODE_CONFIG.exists():
+        return
+    try:
+        data = json.loads(OPENCODE_CONFIG.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Cannot parse {OPENCODE_CONFIG}: {exc}") from exc
     if not isinstance(data, dict):
-        raise RuntimeError(f"{OPENCODE_CONFIG} must contain a JSON object")
-
-    mcp = data.setdefault("mcp", {})
-    if not isinstance(mcp, dict):
-        raise RuntimeError(f"{OPENCODE_CONFIG}: `mcp` must be an object")
-
-    mcp[SERVER_NAME] = {
-        "type": "local",
-        "command": [npx, *args],
-        "enabled": True,
-    }
-
-    new = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    old = OPENCODE_CONFIG.read_text(encoding="utf-8") if OPENCODE_CONFIG.exists() else ""
-    if new != old:
-        OPENCODE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        return
+    mcp = data.get("mcp")
+    if isinstance(mcp, dict) and SERVER_NAME in mcp:
+        mcp.pop(SERVER_NAME, None)
+        new = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
         OPENCODE_CONFIG.write_text(new, encoding="utf-8")
 
 
-def _configure_claude(claude_bin: str, npx: str, args: list[str]) -> None:
+def _disable_claude(claude_bin: str) -> None:
     claude = shutil.which(claude_bin) or claude_bin
     if shutil.which(claude) is None and not Path(claude).exists():
-        raise RuntimeError(f"claude binary not found: {claude_bin}")
-
-    server_json = json.dumps(
-        {"type": "stdio", "command": npx, "args": args},
-        ensure_ascii=False,
-    )
+        # No claude binary — nothing global to clean.
+        return
     subprocess.run(
         [claude, "mcp", "remove", "--scope", "user", SERVER_NAME],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    result = subprocess.run(
-        [claude, "mcp", "add-json", "--scope", "user", SERVER_NAME, server_json],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(stderr or f"claude mcp add-json failed with rc={result.returncode}")
 
 
-def ensure_playwright_mcp(engine_name: str, engine_bin: str) -> tuple[bool, str]:
-    """Ensure Playwright MCP is configured for a single engine.
+def disable_global_playwright_mcp(engine_name: str, engine_bin: str) -> tuple[bool, str]:
+    """Remove any always-on Playwright registration for one engine.
 
-    Returns (ok, human-readable status). The result is cached for the current
-    Jarvis process to avoid touching configs on every prompt.
+    Playwright is injected per invocation now; a leftover global entry from an
+    older Jarvis would put browser tools into every prompt. Idempotent and
+    cached per process. Returns ``(ok, status)``.
     """
     engine_name = engine_name.strip().lower()
-    cached = _STATUS.get(engine_name)
+    cached = _CLEANUP_STATUS.get(engine_name)
     if cached is not None:
         return cached
 
-    raw_enabled = os.environ.get("JARVIS_PLAYWRIGHT_MCP", "1").strip().lower()
-    if raw_enabled in {"0", "false", "no", "off"}:
-        status = (True, "Playwright MCP отключён через JARVIS_PLAYWRIGHT_MCP")
-        _STATUS[engine_name] = status
-        return status
-
     try:
         _validate_server_name()
-        npx = _find_npx()
-        args = _playwright_args()
         if engine_name == "claude":
-            _configure_claude(engine_bin, npx, args)
+            _disable_claude(engine_bin)
         elif engine_name == "codex":
-            _configure_codex(npx, args)
+            _disable_codex()
         elif engine_name == "opencode":
-            _configure_opencode(npx, args)
+            _disable_opencode()
         else:
             raise RuntimeError(f"unknown engine: {engine_name}")
     except Exception as exc:
-        logger.warning("Playwright MCP setup failed for %s: %s", engine_name, exc)
-        status = (False, f"Playwright MCP не подключён: {exc}")
-        _STATUS[engine_name] = status
+        logger.warning("Playwright MCP cleanup failed for %s: %s", engine_name, exc)
+        status = (False, f"Playwright MCP cleanup не выполнен: {exc}")
+        _CLEANUP_STATUS[engine_name] = status
         return status
 
-    status = (True, "Playwright MCP подключён")
-    _STATUS[engine_name] = status
-    logger.info("Playwright MCP configured for engine=%s", engine_name)
+    status = (True, "Playwright MCP — on-demand (глобальная регистрация снята)")
+    _CLEANUP_STATUS[engine_name] = status
     return status

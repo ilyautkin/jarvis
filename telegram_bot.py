@@ -90,16 +90,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _system_prefix(effective_cwd: str) -> str:
-    return (
-        f"[SYSTEM: Сообщение пришло от пользователя через Telegram-бота Jarvis.\n"
+def build_system_prefix(effective_cwd: str, mcp_playwright: bool = False) -> str:
+    """Постоянный [SYSTEM:]-блок для движка.
+
+    Раньше клеился в тело КАЖDОГО user-сообщения и копился в транскрипте.
+    Теперь передаётся в системный канал движка (claude --append-system-prompt;
+    codex/opencode — префиксом только на новой сессии) — один раз на сессию.
+    Строка про браузер добавляется ТОЛЬКО когда Playwright реально подключён
+    (mcp_playwright), иначе не зовём модель пользоваться недоступными тулами.
+    """
+    lines = [
+        "[SYSTEM: Сообщение пришло от пользователя через Telegram-бота Jarvis.",
         f"Ты работаешь в проекте {effective_cwd}. Используй memory-правила из "
-        f"~/.claude/projects/-home-shevartv/memory/.\n"
-        f"Если нужно работать с браузером, используй Playwright MCP browser_* tools, "
-        f"когда они доступны; если MCP недоступен, скажи об этом и выбери рабочий fallback.\n"
-        f"Опасные действия (удаления, DELETE/DROP, действия на проде, sudo, push --force) — "
-        f"переспрашивай.]"
+        "~/.claude/projects/-home-shevartv/memory/.",
+    ]
+    if mcp_playwright:
+        lines.append(
+            "Если нужно работать с браузером, используй Playwright MCP browser_* tools, "
+            "когда они доступны; если MCP недоступен, скажи об этом и выбери рабочий fallback."
+        )
+    lines.append(
+        "Опасные действия (удаления, DELETE/DROP, действия на проде, sudo, push --force) — "
+        "переспрашивай.]"
     )
+    return "\n".join(lines)
 
 
 # ---------- SQLite ----------
@@ -225,6 +239,17 @@ def init_db() -> None:
                 logger.info("adding 'actual_model' column to sessions")
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN actual_model TEXT"
+                )
+            # Idempotent миграция: mcp_playwright — per-topic флаг «браузер
+            # подключён». 0 = off (дефолт): Playwright не грузится в контекст.
+            # 1 = on: адаптер инъектит Playwright MCP per-invocation. Команда
+            # /browser тоглит флаг (с пересозданием session_id — набор тулов).
+            cols_now = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+            if cols_now and "mcp_playwright" not in cols_now:
+                _backup_db_once()
+                logger.info("adding 'mcp_playwright' column to sessions (default=0)")
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN mcp_playwright INTEGER NOT NULL DEFAULT 0"
                 )
         conn.execute(
             """
@@ -1021,6 +1046,43 @@ def get_model(chat_id: int, thread_id: int) -> str | None:
     return row[0] or None
 
 
+def get_mcp_playwright(chat_id: int, thread_id: int) -> bool:
+    """True, если для топика включён браузер (Playwright грузится per-call)."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT mcp_playwright FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, thread_id),
+        ).fetchone()
+    return bool(row[0]) if row and row[0] is not None else False
+
+
+def set_mcp_playwright(chat_id: int, thread_id: int, enabled: bool) -> None:
+    """Выставляет per-topic флаг браузера. Применяется со СЛЕДУЮЩЕГО сообщения:
+    набор тулов движка меняется на лету, сессия и контекст сохраняются.
+    Если записи топика ещё нет — создаёт под дефолтный движок."""
+    now = datetime.utcnow().isoformat()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT cwd, engine FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, thread_id),
+        ).fetchone()
+        if row is None:
+            engine_name = DEFAULT_ENGINE_NAME
+            new_id = get_engine_by_name(engine_name).new_session_id()
+            conn.execute(
+                "INSERT INTO sessions(chat_id, thread_id, session_id, cwd, engine, "
+                "mcp_playwright, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, thread_id, new_id, None, engine_name,
+                 1 if enabled else 0, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE sessions SET mcp_playwright = ?, updated_at = ? "
+                "WHERE chat_id = ? AND thread_id = ?",
+                (1 if enabled else 0, now, chat_id, thread_id),
+            )
+
+
 def update_actual_model(
     chat_id: int, thread_id: int, engine_name: str, model: str | None,
 ) -> None:
@@ -1501,7 +1563,15 @@ async def call_llm_stream(
     """
     mcp_ok, mcp_status = ensure_engine_tools(engine)
     if not mcp_ok:
-        logger.warning("engine=%s activated without Playwright MCP: %s", engine.name, mcp_status)
+        logger.warning("engine=%s MCP setup issue: %s", engine.name, mcp_status)
+
+    # Браузер — on-demand, флаг per-topic. Системный блок строим под флаг
+    # (строка про browser_* только когда Playwright подключён) и передаём в
+    # системный канал движка вместо вшивания в каждый prompt.
+    mcp_playwright = get_mcp_playwright(*key)
+    effective_cwd = cwd or CLAUDE_CWD
+    system_prefix = build_system_prefix(effective_cwd, mcp_playwright)
+
     ok, final_text, sid_after, actual_model = await engine.call_stream(
         session_id=session_id,
         prompt=prompt,
@@ -1511,6 +1581,8 @@ async def call_llm_stream(
         active_procs=active_procs,
         spawn_procs=spawn_procs,
         spawn_id=spawn_id,
+        system_prefix=system_prefix,
+        mcp_playwright=mcp_playwright,
     )
     # Recovery: иногда opencode/codex на resume могут вернуть rc=0, но пустой
     # текст. Для постоянной сессии делаем один автоповтор в новой сессии.
@@ -1535,6 +1607,8 @@ async def call_llm_stream(
                 active_procs=active_procs,
                 spawn_procs=spawn_procs,
                 spawn_id=spawn_id,
+                system_prefix=system_prefix,
+                mcp_playwright=mcp_playwright,
             )
             ok, final_text, sid_after, actual_model = ok2, final_text2, sid_after2, actual_model2
             session_id = new_sid
@@ -1591,6 +1665,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Рабочая директория: `{effective}`" + (" (дефолт)" if not cwd else "") + "\n\n"
         "Команды:\n"
         "/engine [name] — показать/переключить движок (claude|codex|opencode)\n"
+        "/browser [on|off] — браузер (Playwright MCP) для топика, on-demand\n"
         "/new, /reset — новая сессия (cwd сохраняется)\n"
         "/stop — прервать текущий запрос (сессия сохраняется)\n"
         "/session — показать session-id, cwd и движок\n"
@@ -1676,11 +1751,13 @@ def _topic_status_block(key: tuple[int, int]) -> str:
         model_line = f"{model}  (ожидается, ещё не отвечал)"
     else:
         model_line = "(дефолт движка; ещё ни разу не отвечал)"
+    browser_state = "on" if get_mcp_playwright(*key) else "off"
     body = (
         f"engine     : {engine_name}\n"
         f"model      : {model_line}\n"
         f"session-id : {session_id}\n"
-        f"cwd        : {effective_cwd}{cwd_suffix}"
+        f"cwd        : {effective_cwd}{cwd_suffix}\n"
+        f"browser    : {browser_state}  (Playwright MCP, on-demand)"
     )
     return "<pre>" + _html_escape(body) + "</pre>"
 
@@ -1690,6 +1767,105 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         _topic_status_block(key), parse_mode=ParseMode.HTML,
     )
+
+
+def _browser_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    """Кнопка-тоггл браузера для /browser."""
+    target = "off" if enabled else "on"
+    label = "🚫 Выключить браузер" if enabled else "🌐 Включить браузер"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=f"browser_toggle:{target}")]]
+    )
+
+
+def _browser_precheck(enable: bool) -> tuple[bool, str]:
+    """Можно ли включить браузер: npx есть и Playwright не выключен глобально."""
+    if not enable:
+        return True, ""
+    from engines.playwright_mcp import playwright_command_args
+
+    try:
+        spec = playwright_command_args()
+    except Exception as exc:
+        return False, f"⚠️ Playwright недоступен: {exc}"
+    if spec is None:
+        return False, "⚠️ Playwright выключен глобально (JARVIS_PLAYWRIGHT_MCP=0)."
+    return True, ""
+
+
+async def _apply_browser(key: tuple[int, int], enable: bool) -> str:
+    """Применить флаг браузера (с pre-check) и вернуть текст ответа."""
+    ok, msg = _browser_precheck(enable)
+    if not ok:
+        return msg
+    set_mcp_playwright(key[0], key[1], enable)
+    logger.info("browser toggled for key=%s: %s", key, "on" if enable else "off")
+    if enable:
+        return (
+            "🌐 Браузер включён для топика. Playwright MCP подключится со "
+            "СЛЕДУЮЩЕГО сообщения (≈30 browser_* тулов в контексте). Контекст "
+            "сессии сохраняется. Выключай через /browser off, когда закончишь "
+            "— это экономит токены."
+        )
+    return (
+        "🚫 Браузер выключен. Playwright больше не грузится в контекст этого "
+        "топика (со следующего сообщения). Контекст сессии сохранён."
+    )
+
+
+async def cmd_browser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/browser — статус + кнопка; /browser on|off — включить/выключить браузер
+    (Playwright MCP) для текущего топика. On-demand: дефолт off."""
+    key = _key(update)
+    args = [a.strip().lower() for a in (context.args or [])]
+    current = get_mcp_playwright(*key)
+
+    if not args:
+        state = "включён" if current else "выключен"
+        await update.message.reply_text(
+            f"Браузер (Playwright MCP) сейчас {state} для этого топика.\n\n"
+            "On-demand: по умолчанию выключен, чтобы не держать ~30 browser_* "
+            "тулов в каждом запросе. Включай только под браузерные задачи.",
+            reply_markup=_browser_keyboard(current),
+        )
+        return
+
+    arg = args[0]
+    if arg in {"on", "вкл", "1", "true", "yes"}:
+        enable = True
+    elif arg in {"off", "выкл", "0", "false", "no"}:
+        enable = False
+    else:
+        await update.message.reply_text("Использование: /browser [on|off]")
+        return
+
+    if enable == current:
+        await update.message.reply_text(
+            f"Браузер уже {'включён' if current else 'выключен'}."
+        )
+        return
+    await update.message.reply_text(await _apply_browser(key, enable))
+
+
+async def on_browser_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Колбэк кнопки browser_toggle:<on|off>."""
+    query = update.callback_query
+    data = query.data or ""
+    if not data.startswith("browser_toggle:"):
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    enable = data.split(":", 1)[1] == "on"
+    key = _key(update)
+    text = await _apply_browser(key, enable)
+    try:
+        await query.edit_message_text(
+            text, reply_markup=_browser_keyboard(get_mcp_playwright(*key)),
+        )
+    except BadRequest:
+        await send_to_topic(update.effective_chat, key[1], text)
 
 
 def _engine_keyboard(current_engine: str) -> InlineKeyboardMarkup:
@@ -1819,9 +1995,9 @@ async def _generate_handoff_summary(
     old_session_id, _, _ = get_session(*key)
     effective_cwd = cwd or CLAUDE_CWD
 
+    # Системный блок добавит call_llm_stream через системный канал движка —
+    # здесь только сама инструкция на summary.
     summary_prompt = (
-        _system_prefix(effective_cwd)
-        + "\n\n---\n\n"
         "Сделай краткое резюме нашего диалога для передачи другому LLM-агенту, "
         "который продолжит разговор вместо тебя. Включи: 1) цель/задачу, "
         "2) текущий статус и ключевые решения, 3) что уже выяснено или сделано, "
@@ -2448,7 +2624,7 @@ async def _process_prompt(
                 logger.info("delivering pending_summary to engine=%s key=%s (%d chars)",
                             engine_name, key, len(pending_summary))
 
-        prompt_parts = [_system_prefix(effective_cwd)]
+        prompt_parts: list[str] = []  # [SYSTEM:]-блок уходит через системный канал движка
         if pending_summary:
             prompt_parts.append(
                 "[Контекст от предыдущего движка — резюме прошлого диалога, "
@@ -2556,9 +2732,9 @@ async def _run_spawn(update: Update, user_text: str) -> None:
     effective_cwd = cwd or CLAUDE_CWD
     session_id = engine.new_session_id()
 
+    # [SYSTEM:]-блок уходит через системный канал движка (call_llm_stream).
     prompt = (
-        _system_prefix(effective_cwd)
-        + "\n\n---\n\nСообщение пользователя (одноразовый spawn):\n"
+        "---\n\nСообщение пользователя (одноразовый spawn):\n"
         + user_text
     )
 
@@ -2668,7 +2844,7 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
         pending_raw = pop_pending_summary(*key)
         pending_summary = await _resolve_pending_summary(key, pending_raw) if pending_raw else None
 
-        prompt_parts = [_system_prefix(effective_cwd)]
+        prompt_parts: list[str] = []  # [SYSTEM:]-блок уходит через системный канал движка
         if pending_summary:
             prompt_parts.append(
                 "[Контекст от предыдущего движка — резюме прошлого диалога, "
@@ -3260,6 +3436,7 @@ def main() -> None:
     app.add_handler(CommandHandler("spawn", cmd_spawn, filters=allowed))
     app.add_handler(CommandHandler("session", cmd_session, filters=allowed))
     app.add_handler(CommandHandler("engine", cmd_engine, filters=allowed))
+    app.add_handler(CommandHandler("browser", cmd_browser, filters=allowed))
     app.add_handler(CommandHandler("bind", cmd_bind, filters=allowed))
     app.add_handler(CommandHandler("unbind", cmd_unbind, filters=allowed))
     app.add_handler(CommandHandler("where", cmd_where, filters=allowed))
@@ -3271,6 +3448,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_engine_select, pattern=r"^engine_select:"))
     app.add_handler(CallbackQueryHandler(on_model_select, pattern=r"^model_select:"))
     app.add_handler(CallbackQueryHandler(on_engine_carry, pattern=r"^engine_carry:"))
+    app.add_handler(CallbackQueryHandler(on_browser_toggle, pattern=r"^browser_toggle:"))
 
     app.add_handler(MessageHandler(~allowed, unauthorized_handler))
 

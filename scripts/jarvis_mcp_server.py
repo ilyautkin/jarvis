@@ -435,6 +435,61 @@ def manager_set_engine(
 
 
 @mcp.tool(
+    name="manager_set_browser",
+    description=(
+        "Toggle browser support (Playwright MCP) for a topic. Same semantics "
+        "as the bot's /browser command. Playwright is OFF by default and "
+        "on-demand: ~30 browser_* tools are loaded into the engine's context "
+        "ONLY for topics where it's enabled, so leave it off unless the next "
+        "task actually needs a browser. Takes effect on the next message/job "
+        "in that topic; the session and its context are kept (no reset). Call "
+        "this BEFORE manager_send when delegating a browser task."
+    ),
+)
+def manager_set_browser(
+    thread_id: int,
+    enabled: bool,
+    chat_id: int | None = None,
+) -> dict[str, Any]:
+    """Persistently set the topic's mcp_playwright flag."""
+    target_chat_id = chat_id if chat_id is not None else _default_chat_id()
+    now = datetime.utcnow().isoformat()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT cwd, engine, topic_title, mcp_playwright FROM sessions "
+            "WHERE chat_id = ? AND thread_id = ?",
+            (target_chat_id, thread_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"topic chat_id={target_chat_id} thread_id={thread_id} is not "
+                "tracked — call manager_create_topic first."
+            )
+        previous = bool(row["mcp_playwright"])
+        conn.execute(
+            "UPDATE sessions SET mcp_playwright = ?, updated_at = ? "
+            "WHERE chat_id = ? AND thread_id = ?",
+            (1 if enabled else 0, now, target_chat_id, thread_id),
+        )
+    logger.info(
+        "browser toggled topic chat=%s thread=%s: %s -> %s",
+        target_chat_id, thread_id, previous, enabled,
+    )
+    return {
+        "chat_id": target_chat_id,
+        "thread_id": thread_id,
+        "title": row["topic_title"],
+        "cwd": row["cwd"],
+        "engine": row["engine"],
+        "browser": "on" if enabled else "off",
+        "previous": "on" if previous else "off",
+        "note": (
+            "Takes effect on the next message/job; session context is kept."
+        ),
+    }
+
+
+@mcp.tool(
     name="manager_create_topic",
     description=(
         "Create a new Telegram forum topic and bind it to a project. Picks a "

@@ -15,12 +15,17 @@
   (новый session_id под новый движок, cwd сохраняется, контекст прежнего диалога
   не переносится).
 - `/new` или `/reset` — начать новую сессию (движок сохраняется).
-- `/session` — показать текущий session-id, cwd и движок.
+- `/session` — показать текущий session-id, cwd, движок и состояние браузера.
+- `/browser [on|off]` — включить/выключить браузер (Playwright MCP) для топика.
+  По умолчанию **выключен** (on-demand): браузерные tools грузятся в контекст
+  только там, где реально нужны — иначе ~30 `browser_*` тулов висят в каждом
+  запросе и зря жгут токены.
 - Длинные ответы (> 3500 символов) присылаются как `.md`-файл с коротким превью.
 - Reply-to на сообщение бота → в запрос подмешивается скрытый контекст о том, на что ты отвечаешь.
 - Фото/документы скачиваются локально, путь прокидывается в prompt (`[Прикреплён файл: ...]`).
-- Playwright MCP автоматически подключается к активному движку, чтобы Jarvis
-  мог управлять браузером через `browser_*` tools независимо от выбранного CLI.
+- Playwright MCP — **on-demand** для любого движка (`claude`/`codex`/`opencode`):
+  включается per-topic командой `/browser on` и инъектируется в CLI на каждый
+  запрос, без постоянной глобальной регистрации.
 - Голосовые не поддерживаются.
 - Whitelist по `user_id` (см. `ALLOWED_USER_IDS`).
 
@@ -76,8 +81,9 @@ claude -p "hello"   # проверка, что авторизация работ
   но можно указать `http://127.0.0.1:9222` или другой доступный endpoint.
 - `PLAYWRIGHT_MCP_ARGS` — дополнительные аргументы Playwright MCP. Для CDP
   режима обычно используют capabilities, например `--caps=vision,pdf,devtools`.
-- `JARVIS_PLAYWRIGHT_MCP` — `1`/`0`, включает автоматическое подключение
-  Playwright MCP при активации движка (по умолчанию включено).
+- `JARVIS_PLAYWRIGHT_MCP` — `1`/`0`, глобальный рубильник браузера. `1`
+  (по умолчанию) — `/browser on` разрешён, Playwright инъектируется per-topic.
+  `0` — браузер недоступен вообще (даже если флаг топика включён).
 - `JARVIS_MANAGER_MCP` — `1`/`0`, аналогично для Jarvis Manager MCP (см. ниже).
 - `JARVIS_MCP_NAME` — имя MCP-сервера в конфигах движков (по умолчанию `jarvis`).
 - `JARVIS_MCP_PYTHON` — путь к Python для запуска MCP-сервера (по умолчанию
@@ -100,21 +106,68 @@ claude -p "hello"   # проверка, что авторизация работ
 - `JARVIS_REMINDERS_TZ` — таймзона для парсинга времён в schedule
   (`daily HH:MM` и т.п.). Дефолт `Europe/Moscow`.
 
-### Playwright MCP для всех движков
+### Playwright MCP — on-demand для всех движков
 
 Jarvis сам не является MCP-клиентом: браузерные tools поднимают внешние CLI.
-Поэтому при активации или первом использовании движка Jarvis сам идемпотентно
-прописывает Playwright MCP в конфиг соответствующего CLI.
+~30 `browser_*` тулов — это заметный объём контекста в каждом запросе, поэтому
+Playwright **не** регистрируется глобально, а инъектируется **per-invocation**
+только для топиков, где включён флаг `mcp_playwright` (команда `/browser on`
+или MCP-tool `manager_set_browser`). Manager MCP, напротив, остаётся глобальным
+(он лёгкий и нужен оркестрации) — см. ниже.
 
-- Claude Code: user-scope сервер через `claude mcp add-json --scope user`.
-- Codex CLI: `[mcp_servers.playwright]` в `~/.codex/config.toml`.
-- opencode: `mcp.playwright` в `~/.config/opencode/opencode.json`.
+Единый источник спеки сервера — `playwright_command_args()` в
+`engines/playwright_mcp.py` (резолвит `npx` + аргументы). Каждый адаптер
+переводит её в свой диалект CLI на каждый вызов:
+
+- **claude**: флаг `--mcp-config '<inline-json>'` (аддитивно к глобальному
+  Manager MCP, без `--strict-mcp-config`).
+- **codex**: оверрайды `-c mcp_servers.playwright.command=… -c …args=[…] -c
+  …enabled=true` поверх `~/.codex/config.toml`.
+- **opencode**: у `opencode run` нет per-invocation MCP-флага, поэтому Jarvis
+  клонирует глобальный `opencode.json` (Manager MCP и provider-настройки
+  сохраняются), добавляет `mcp.playwright` во временный файл и подсовывает его
+  через `OPENCODE_CONFIG=<tempfile>` на конкретный запуск. Temp-файл удаляется
+  после ответа.
 
 Команда MCP по умолчанию: абсолютный `npx -y @playwright/mcp@latest --cdp-endpoint=chrome`.
 Абсолютный путь важен для systemd: в сервисе Jarvis nvm обычно не попадает в
 `PATH`, а `npx` лежит именно там.
 
 Если нужен порт, а не channel name, задай `PLAYWRIGHT_MCP_CDP_ENDPOINT=http://127.0.0.1:9222`.
+
+При старте/активации движка Jarvis ещё и **снимает** старую глобальную
+регистрацию Playwright (`disable_global_playwright_mcp`), если она осталась от
+прежних версий — чтобы on-demand-модель не нарушалась always-on сервером.
+
+> **codex/opencode — проверка на боевой версии CLI.** Парсинг `-c
+> mcp_servers.playwright.args=[…]` у codex и поведение `OPENCODE_CONFIG` у
+> opencode зависят от версии CLI. Если браузер в этих движках не поднимается:
+>
+> - **codex**: пропиши Playwright руками в `~/.codex/config.toml`
+>   (`[mcp_servers.playwright]` с `command`/`args`/`enabled = true`) — тогда
+>   браузер будет always-on для codex; либо проверь формат `-c` своей версии
+>   (`codex exec -c 'mcp_servers.playwright.enabled=true' …`).
+> - **opencode**: пропиши `mcp.playwright` прямо в
+>   `~/.config/opencode/opencode.json` (always-on), либо убедись, что твоя
+>   версия читает `OPENCODE_CONFIG`.
+>
+> claude (основной канал) работает через `--mcp-config` без оговорок.
+
+### Как подключить новый движок
+
+Браузер on-demand — часть контракта `Engine.call_stream` (см.
+`engines/__init__.py`). Новый адаптер обязан принять и обработать два
+параметра:
+
+- `system_prefix: str | None` — постоянный `[SYSTEM:]`-блок. Положи его в
+  системный канал своего CLI (как `--append-system-prompt` у claude). Если
+  канала нет — префиксуй prompt **только на новой сессии** (на resume он уже
+  в транскрипте), как сделано в codex/opencode.
+- `mcp_playwright: bool` — если `True`, инъектируй Playwright per-invocation:
+  возьми спеку из `playwright_command_args()` и переведи в механизм своего CLI
+  (флаг конфига / оверрайд / временный конфиг через env). Если CLI вообще не
+  умеет per-invocation MCP — задокументируй ручную глобальную настройку как
+  фолбэк (раздел выше).
 
 ### Jarvis Manager MCP (для агента-Менеджера)
 
@@ -129,6 +182,12 @@ Jarvis сам не является MCP-клиентом: браузерные t
   `cwd_contains`, `engine`, `limit`.
 - `manager_inbox` — лог сообщений одного топика. Параметры: `chat_id`,
   `thread_id`, `since` (ISO UTC), `limit`, `text_limit`, `direction`.
+- `manager_set_browser` — включить/выключить браузер (Playwright MCP) для
+  топика (`thread_id`, `enabled`). Аналог команды `/browser`. Применяется со
+  следующего сообщения/джоба, контекст сессии сохраняется.
+
+(Это не полный список — есть и write-tools: `manager_send`, `manager_set_engine`,
+`manager_create_topic` и др. См. декораторы `@mcp.tool` в `scripts/jarvis_mcp_server.py`.)
 
 Точки записи в `messages_log`: входящие пользовательские реплики
 (`direction='in'`, `kind='user_text'`) и финальные ответы бота
