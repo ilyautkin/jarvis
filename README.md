@@ -16,6 +16,11 @@
   не переносится).
 - `/new` или `/reset` — начать новую сессию (движок сохраняется).
 - `/session` — показать текущий session-id, cwd, движок и состояние браузера.
+- `/tokens` — показать оценку размера текущей LLM-сессии и пороги autocompact.
+- `/compact` — вручную сжать текущий диалог: старая сессия пишет summary,
+  Jarvis создаёт новый `session_id`, а summary доставляется в следующий prompt.
+- `/autocompact [on|off|status|inherit]` — per-topic управление авто-сжатием
+  длинных сессий.
 - `/browser [on|off]` — включить/выключить браузер (Playwright MCP) для топика.
   По умолчанию **выключен** (on-demand): браузерные tools грузятся в контекст
   только там, где реально нужны — иначе ~30 `browser_*` тулов висят в каждом
@@ -84,6 +89,15 @@ claude -p "hello"   # проверка, что авторизация работ
 - `JARVIS_PLAYWRIGHT_MCP` — `1`/`0`, глобальный рубильник браузера. `1`
   (по умолчанию) — `/browser on` разрешён, Playwright инъектируется per-topic.
   `0` — браузер недоступен вообще (даже если флаг топика включён).
+- `JARVIS_AUTOCOMPACT` — `1`/`0`, глобальный дефолт auto-compact для новых и
+  не переопределённых топиков. Дефолт `1`.
+- `JARVIS_AUTOCOMPACT_WARN_TOKENS` — информационный порог для `/tokens`.
+  Дефолт `200000`.
+- `JARVIS_AUTOCOMPACT_MAX_TOKENS` — порог, после которого перед следующим
+  обычным запросом Jarvis запускает summary старой сессии, создаёт новый
+  `session_id` и передаёт summary в новый prompt. Дефолт `250000`.
+- `JARVIS_AUTOCOMPACT_SUMMARY_CHARS` — максимальная длина summary, которое
+  переносится в новую сессию. Дефолт `4000`.
 - `JARVIS_MANAGER_MCP` — `1`/`0`, аналогично для Jarvis Manager MCP (см. ниже).
 - `JARVIS_MCP_NAME` — имя MCP-сервера в конфигах движков (по умолчанию `jarvis`).
 - `JARVIS_MCP_PYTHON` — путь к Python для запуска MCP-сервера (по умолчанию
@@ -156,6 +170,34 @@ Playwright **не** регистрируется глобально, а инъе
 >   версия читает `OPENCODE_CONFIG`.
 >
 > claude (основной канал) работает через `--mcp-config` без оговорок.
+
+### Autocompact длинных сессий
+
+Jarvis умеет контролировать размер контекста текущей LLM-сессии. Перед обычным
+сообщением пользователя и перед manager-job бот смотрит usage текущего
+`session_id`; если оценка выше `JARVIS_AUTOCOMPACT_MAX_TOKENS`, запускается
+сжатие: старая сессия получает prompt на summary, затем Jarvis создаёт новый
+`session_id`, кладёт summary в `pending_summary` и доставляет его в первый
+prompt новой сессии.
+
+Команды:
+
+- `/tokens` — показать текущую оценку, источник данных и пороги.
+- `/compact` — принудительно выполнить summary + новую сессию сейчас.
+- `/autocompact on|off|status|inherit` — включить/выключить для топика или
+  вернуть наследование глобального `JARVIS_AUTOCOMPACT`.
+- `scripts/session_tokens.py --chat-id <id> --thread-id <id>` — та же
+  диагностика из shell. Можно также передать `--engine <name> --session-id <id>`.
+
+Источники оценки:
+
+- `claude` — точный последний `message.usage` из
+  `~/.claude/projects/<cwd>/<session_id>.jsonl` (`input + cache_read +
+  cache_creation`).
+- `opencode` — точные токены последнего assistant-message из
+  `~/.local/share/opencode/opencode.db`.
+- `codex` — best-effort estimate по размеру локального JSONL, потому что
+  локальный session-log Codex CLI пока не даёт стабильного usage-поля.
 
 ### Как подключить новый движок
 

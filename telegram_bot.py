@@ -56,6 +56,7 @@ from engines import (
     get_engine_by_name,
 )
 from engines.process_control import terminate_process_tree
+from engines.session_usage import SessionUsage, inspect_session_usage
 
 # ---------- Константы ----------
 
@@ -68,9 +69,23 @@ DEFAULT_ENGINE = get_engine_by_name(DEFAULT_ENGINE_NAME)
 # для обратной совместимости: задаёт дефолт для любого движка.
 CLAUDE_CWD = os.environ.get("CLAUDE_CWD", "/home/shevartv")
 
+def _int_env_raw(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 MSG_LIMIT = 3500           # порог отправки ответа как документ
 TG_HARD_LIMIT = 4096       # жёсткий лимит Telegram
 TG_FILE_LIMIT_MB = 50      # Telegram Bot API лимит на sendDocument
+
+AUTOCOMPACT_DEFAULT = os.environ.get("JARVIS_AUTOCOMPACT", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+AUTOCOMPACT_WARN_TOKENS = _int_env_raw("JARVIS_AUTOCOMPACT_WARN_TOKENS", 200000)
+AUTOCOMPACT_MAX_TOKENS = _int_env_raw("JARVIS_AUTOCOMPACT_MAX_TOKENS", 250000)
+AUTOCOMPACT_SUMMARY_CHARS = _int_env_raw("JARVIS_AUTOCOMPACT_SUMMARY_CHARS", 4000)
 
 # Маркер для отправки файлов из LLM-сессии: [[FILE: /abs/path]] или [[FILE: /path | подпись]].
 # Должен стоять на отдельной строке (но допускаются пробелы вокруг).
@@ -250,6 +265,15 @@ def init_db() -> None:
                 logger.info("adding 'mcp_playwright' column to sessions (default=0)")
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN mcp_playwright INTEGER NOT NULL DEFAULT 0"
+                )
+            # Idempotent миграция: autocompact_enabled — per-topic override.
+            # NULL = наследовать JARVIS_AUTOCOMPACT, 0/1 = явно выключено/включено.
+            cols_now = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+            if cols_now and "autocompact_enabled" not in cols_now:
+                _backup_db_once()
+                logger.info("adding 'autocompact_enabled' column to sessions")
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN autocompact_enabled INTEGER"
                 )
         conn.execute(
             """
@@ -1068,6 +1092,45 @@ def get_mcp_playwright(chat_id: int, thread_id: int) -> bool:
     return bool(row[0]) if row and row[0] is not None else False
 
 
+def get_autocompact_enabled(chat_id: int, thread_id: int) -> bool:
+    """Per-topic autocompact flag. NULL means inherit env default."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT autocompact_enabled FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, thread_id),
+        ).fetchone()
+    if not row or row[0] is None:
+        return AUTOCOMPACT_DEFAULT
+    return bool(row[0])
+
+
+def set_autocompact_enabled(chat_id: int, thread_id: int, enabled: bool | None) -> None:
+    """Set per-topic autocompact flag. None resets to env default."""
+    now = datetime.utcnow().isoformat()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT cwd, engine FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, thread_id),
+        ).fetchone()
+        value = None if enabled is None else (1 if enabled else 0)
+        if row is None:
+            engine_name = DEFAULT_ENGINE_NAME
+            conn.execute(
+                "INSERT INTO sessions(chat_id, thread_id, session_id, cwd, engine, "
+                "autocompact_enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    chat_id, thread_id, get_engine_by_name(engine_name).new_session_id(),
+                    None, engine_name, value, now,
+                ),
+            )
+        else:
+            conn.execute(
+                "UPDATE sessions SET autocompact_enabled = ?, updated_at = ? "
+                "WHERE chat_id = ? AND thread_id = ?",
+                (value, now, chat_id, thread_id),
+            )
+
+
 def set_mcp_playwright(chat_id: int, thread_id: int, enabled: bool) -> None:
     """Выставляет per-topic флаг браузера. Применяется со СЛЕДУЮЩЕГО сообщения:
     набор тулов движка меняется на лету, сессия и контекст сохраняются.
@@ -1678,6 +1741,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды:\n"
         "/engine [name] — показать/переключить движок (claude|codex|opencode)\n"
         "/browser [on|off] — браузер (Playwright MCP) для топика, on-demand\n"
+        "/tokens — оценка размера текущей сессии\n"
+        "/compact — вручную сделать summary и начать новую сессию\n"
+        "/autocompact [on|off|status] — авто-сжатие длинной сессии\n"
         "/new, /reset — новая сессия (cwd сохраняется)\n"
         "/stop — прервать текущий запрос (сессия сохраняется)\n"
         "/session — показать session-id, cwd и движок\n"
@@ -1764,12 +1830,14 @@ def _topic_status_block(key: tuple[int, int]) -> str:
     else:
         model_line = "(дефолт движка; ещё ни разу не отвечал)"
     browser_state = "on" if get_mcp_playwright(*key) else "off"
+    compact_state = "on" if get_autocompact_enabled(*key) else "off"
     body = (
         f"engine     : {engine_name}\n"
         f"model      : {model_line}\n"
         f"session-id : {session_id}\n"
         f"cwd        : {effective_cwd}{cwd_suffix}\n"
-        f"browser    : {browser_state}  (Playwright MCP, on-demand)"
+        f"browser    : {browser_state}  (Playwright MCP, on-demand)\n"
+        f"compact    : {compact_state}  (max={AUTOCOMPACT_MAX_TOKENS})"
     )
     return "<pre>" + _html_escape(body) + "</pre>"
 
@@ -1779,6 +1847,86 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         _topic_status_block(key), parse_mode=ParseMode.HTML,
     )
+
+
+async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    key = _key(update)
+    session_id, cwd, engine_name = get_session(*key)
+    usage = inspect_session_usage(engine_name, session_id, cwd or CLAUDE_CWD)
+    status = "on" if get_autocompact_enabled(*key) else "off"
+    body = (
+        f"engine      : {engine_name}\n"
+        f"session-id  : {session_id}\n"
+        f"autocompact: {status}\n"
+        f"warn        : {AUTOCOMPACT_WARN_TOKENS}\n"
+        f"max         : {AUTOCOMPACT_MAX_TOKENS}\n"
+        f"usage       : {_usage_line(usage)}"
+    )
+    if usage.path:
+        body += f"\npath        : {usage.path}"
+    await update.message.reply_text("<pre>" + _html_escape(body) + "</pre>", parse_mode=ParseMode.HTML)
+
+
+async def cmd_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    key = _key(update)
+    if active_procs.get(key) is not None:
+        await update.message.reply_text("Сейчас в топике идёт запрос. Сначала /stop или дождись ответа.")
+        return
+    msg = await update.message.reply_text("Сжимаю контекст текущей сессии...")
+    lock = _lock_for(key)
+    await lock.acquire()
+    ok = False
+    result = "внутренняя ошибка"
+    try:
+        _session_id, cwd, engine_name = get_session(*key)
+        model = get_model(*key)
+
+        async def notify(text: str) -> None:
+            try:
+                await msg.edit_text(text[-TG_HARD_LIMIT:])
+            except Exception:
+                pass
+
+        ok, result = await _compact_current_session(
+            key, "manual /compact", engine_name, cwd, model, notify,
+        )
+    except Exception as exc:
+        logger.exception("manual compact failed key=%s", key)
+        result = str(exc)
+    finally:
+        try:
+            lock.release()
+        except RuntimeError:
+            pass
+    await msg.edit_text(("Готово: " if ok else "Не получилось: ") + result)
+
+
+async def cmd_autocompact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    key = _key(update)
+    args = [a.strip().lower() for a in (context.args or [])]
+    if not args or args[0] in {"status", "статус"}:
+        inherited = "on" if AUTOCOMPACT_DEFAULT else "off"
+        current = "on" if get_autocompact_enabled(*key) else "off"
+        await update.message.reply_text(
+            "Autocompact: "
+            f"{current} (env default: {inherited}, warn={AUTOCOMPACT_WARN_TOKENS}, "
+            f"max={AUTOCOMPACT_MAX_TOKENS}).\n"
+            "Команды: /autocompact on | off | inherit"
+        )
+        return
+    arg = args[0]
+    if arg in {"on", "вкл", "1", "true", "yes"}:
+        set_autocompact_enabled(key[0], key[1], True)
+        await update.message.reply_text("Autocompact включён для этого топика.")
+    elif arg in {"off", "выкл", "0", "false", "no"}:
+        set_autocompact_enabled(key[0], key[1], False)
+        await update.message.reply_text("Autocompact выключен для этого топика.")
+    elif arg in {"inherit", "default", "env", "auto"}:
+        set_autocompact_enabled(key[0], key[1], None)
+        inherited = "on" if AUTOCOMPACT_DEFAULT else "off"
+        await update.message.reply_text(f"Autocompact снова наследует env default: {inherited}.")
+    else:
+        await update.message.reply_text("Используй: /autocompact on | off | inherit | status")
 
 
 def _browser_keyboard(enabled: bool) -> InlineKeyboardMarkup:
@@ -2036,8 +2184,90 @@ async def _generate_handoff_summary(
 
     cleaned, _ = extract_file_markers(summary_text)
     cleaned = cleaned.strip() or summary_text.strip()
-    cleaned = cleaned[:4000]
+    cleaned = cleaned[:AUTOCOMPACT_SUMMARY_CHARS]
     return cleaned
+
+
+def _usage_line(usage: SessionUsage) -> str:
+    token_value = usage.threshold_tokens
+    token_part = "unknown" if token_value is None else f"{token_value:,}".replace(",", " ")
+    suffix = " (estimate)" if usage.is_estimate else ""
+    bits = [f"context: {token_part}{suffix}", f"source: {usage.source}"]
+    if usage.cache_read_tokens is not None:
+        bits.append(f"cache_read: {usage.cache_read_tokens:,}".replace(",", " "))
+    if usage.cache_write_tokens is not None:
+        bits.append(f"cache_write: {usage.cache_write_tokens:,}".replace(",", " "))
+    if usage.output_tokens is not None:
+        bits.append(f"last_output: {usage.output_tokens:,}".replace(",", " "))
+    if usage.bytes_size is not None:
+        bits.append(f"file: {usage.bytes_size / 1024 / 1024:.1f} MB")
+    if usage.note:
+        bits.append(f"note: {usage.note}")
+    return "; ".join(bits)
+
+
+def _inspect_topic_usage(key: tuple[int, int]) -> SessionUsage:
+    session_id, cwd, engine_name = get_session(*key)
+    return inspect_session_usage(engine_name, session_id, cwd or CLAUDE_CWD)
+
+
+def _autocompact_reason(usage: SessionUsage) -> str | None:
+    tokens = usage.threshold_tokens
+    if tokens is None:
+        return None
+    if tokens >= AUTOCOMPACT_MAX_TOKENS:
+        label = "estimated " if usage.is_estimate else ""
+        return (
+            f"{label}context {tokens} tokens >= "
+            f"JARVIS_AUTOCOMPACT_MAX_TOKENS={AUTOCOMPACT_MAX_TOKENS}"
+        )
+    return None
+
+
+async def _compact_current_session(
+    key: tuple[int, int],
+    reason: str,
+    old_engine_name: str,
+    cwd: str | None,
+    old_model: str | None,
+    notify=None,
+) -> tuple[bool, str]:
+    """Summarize current session, reset session_id, store summary for next prompt."""
+    if notify is not None:
+        await notify(f"Сжимаю контекст: {reason}")
+    summary = await _generate_handoff_summary(key, old_engine_name, cwd, old_model)
+    if not summary:
+        return False, "не удалось получить summary старой сессии"
+
+    new_id, effective_cwd, engine_name = reset_session(*key)
+    set_pending_summary(key[0], key[1], summary)
+    logger.info(
+        "autocompact done: key=%s engine=%s new_session=%s summary_len=%d reason=%s",
+        key, engine_name, new_id, len(summary), reason,
+    )
+    return (
+        True,
+        f"контекст сжат; новая сессия {new_id}; cwd={effective_cwd or CLAUDE_CWD}",
+    )
+
+
+async def _maybe_autocompact(
+    key: tuple[int, int],
+    engine_name: str,
+    cwd: str | None,
+    model: str | None,
+    notify=None,
+) -> None:
+    if not get_autocompact_enabled(*key):
+        return
+    usage = _inspect_topic_usage(key)
+    reason = _autocompact_reason(usage)
+    if reason is None:
+        return
+    ok, msg = await _compact_current_session(key, reason, engine_name, cwd, model, notify)
+    if notify is not None:
+        prefix = "Autocompact готов:" if ok else "Autocompact не выполнен:"
+        await notify(f"{prefix} {msg}")
 
 
 async def _do_engine_handoff(
@@ -2626,6 +2856,18 @@ async def _process_prompt(
         model = get_model(*key)
         effective_cwd = cwd or CLAUDE_CWD
 
+        async def compact_notify(text: str) -> None:
+            try:
+                await send_to_topic(chat, thread_id, "♻️ " + text)
+            except Exception:
+                logger.exception("failed to send autocompact notice key=%s", key)
+
+        await _maybe_autocompact(key, engine_name, cwd, model, compact_notify)
+        session_id, cwd, engine_name = get_session(*key)
+        engine = get_engine_by_name(engine_name)
+        model = get_model(*key)
+        effective_cwd = cwd or CLAUDE_CWD
+
         # Pending handoff summary: pop'аем атомарно — доставляется ровно один раз,
         # в первый prompt после переключения движка с переносом контекста.
         pending_raw = pop_pending_summary(*key)
@@ -2848,6 +3090,21 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
     await lock.acquire()
     try:
         logger.info("manager job %s: lock acquired key=%s", job_id, key)
+        session_id, cwd, engine_name = get_session(*key)
+        engine = get_engine_by_name(engine_name)
+        model = get_model(*key)
+        effective_cwd = cwd or CLAUDE_CWD
+
+        async def compact_notify(text: str) -> None:
+            if is_self_kick:
+                logger.info("manager job %s autocompact: %s", job_id, text)
+                return
+            try:
+                await send_to_topic(chat, thread_id, "♻️ " + text)
+            except Exception:
+                logger.exception("manager job %s: autocompact notice failed", job_id)
+
+        await _maybe_autocompact(key, engine_name, cwd, model, compact_notify)
         session_id, cwd, engine_name = get_session(*key)
         engine = get_engine_by_name(engine_name)
         model = get_model(*key)
@@ -3395,6 +3652,9 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("engine", "движок: показать/переключить (claude|codex|opencode)"),
     BotCommand("new", "новая сессия (cwd и движок сохраняются)"),
     BotCommand("session", "session-id, cwd и движок"),
+    BotCommand("tokens", "оценка размера текущей сессии"),
+    BotCommand("compact", "сжать контекст: summary + новая сессия"),
+    BotCommand("autocompact", "авто-сжатие длинной сессии"),
     BotCommand("stop", "прервать текущий запрос"),
     BotCommand("spawn", "одноразовая параллельная сессия — /spawn <prompt>"),
     BotCommand("bind", "привязать топик к каталогу — /bind <abs path>"),
@@ -3496,6 +3756,9 @@ def main() -> None:
     app.add_handler(CommandHandler("stop", cmd_stop, filters=allowed))
     app.add_handler(CommandHandler("spawn", cmd_spawn, filters=allowed))
     app.add_handler(CommandHandler("session", cmd_session, filters=allowed))
+    app.add_handler(CommandHandler("tokens", cmd_tokens, filters=allowed))
+    app.add_handler(CommandHandler("compact", cmd_compact, filters=allowed))
+    app.add_handler(CommandHandler("autocompact", cmd_autocompact, filters=allowed))
     app.add_handler(CommandHandler("engine", cmd_engine, filters=allowed))
     app.add_handler(CommandHandler("browser", cmd_browser, filters=allowed))
     app.add_handler(CommandHandler("bind", cmd_bind, filters=allowed))
