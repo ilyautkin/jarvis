@@ -20,10 +20,13 @@ venv/
 temp/
 models/
 .claude/
+.opencode/
 
 # State / DB
 bot_state.db
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 *.bak-*
