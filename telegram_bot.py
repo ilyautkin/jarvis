@@ -429,7 +429,9 @@ def log_message(
                          chat_id, thread_id, kind)
 
 
-def claim_next_job() -> dict | None:
+def claim_next_job(
+    exclude_keys: frozenset[tuple[int, int]] | None = None,
+) -> dict | None:
     """Atomically claim one pending job that's due now. Returns its row as
     a dict or None.
 
@@ -438,15 +440,25 @@ def claim_next_job() -> dict | None:
     is by "effective firing time" (`COALESCE(not_before, created_at)`) so
     that a live live job created during a 10-min wait gets handled before
     the wait expires.
+
+    `exclude_keys` — топики (chat_id, thread_id), у которых уже есть задача в
+    работе. Пропускаются, чтобы (а) сохранить порядок внутри топика и (б) не
+    занимать слот пула ожиданием per-topic лока. Параллельный диспетчер
+    обрабатывает задачи РАЗНЫХ топиков одновременно; claim атомарен и
+    multi-worker-safe (см. rowcount-проверку ниже).
     """
     now = datetime.utcnow().isoformat()
+    sql = (
+        "SELECT id, chat_id, thread_id, text, source FROM jobs "
+        "WHERE status = 'pending' AND (not_before IS NULL OR not_before <= ?)"
+    )
+    params = [now]
+    for chat_id, thread_id in (exclude_keys or ()):
+        sql += " AND NOT (chat_id = ? AND thread_id = ?)"
+        params.extend([chat_id, thread_id])
+    sql += " ORDER BY COALESCE(not_before, created_at) ASC, id ASC LIMIT 1"
     with _db() as conn:
-        row = conn.execute(
-            "SELECT id, chat_id, thread_id, text, source FROM jobs "
-            "WHERE status = 'pending' AND (not_before IS NULL OR not_before <= ?) "
-            "ORDER BY COALESCE(not_before, created_at) ASC, id ASC LIMIT 1",
-            (now,),
-        ).fetchone()
+        row = conn.execute(sql, params).fetchone()
         if not row:
             return None
         cur = conn.execute(
@@ -3193,35 +3205,84 @@ async def health_worker(app: Application) -> None:
             await asyncio.sleep(60.0)
 
 
-async def jobs_worker(app: Application) -> None:
-    """Long-running background task: pull pending jobs and run them.
+# Топики, у которых сейчас выполняется делегированная задача. Диспетчер не
+# claim'ит новую задачу для топика из этого множества — это сохраняет порядок
+# задач внутри топика и не даёт слоту пула висеть на per-topic локе.
+_inflight_job_keys: set[tuple[int, int]] = set()
 
-    One worker is enough for now — jobs serialise per-topic anyway via the
-    same key-lock the user-side pipeline uses. The poll interval is intentionally
-    short (~2s) because the queue is meant for interactive delegation.
+
+async def _run_job_slot(
+    app: Application,
+    job: dict,
+    key: tuple[int, int],
+    sem: asyncio.Semaphore,
+) -> None:
+    """Выполнить одну делегированную задачу в слоте пула и освободить слот.
+    Сериализация внутри топика — через per-topic _lock_for в _run_manager_job."""
+    job_id = job["id"]
+    try:
+        ok, msg_id, err_text = await _run_manager_job(app, job)
+        finish_job(
+            job_id, "done" if ok else "failed",
+            None if ok else (err_text or "engine returned no usable reply"),
+            msg_id,
+        )
+    except asyncio.CancelledError:
+        finish_job(job_id, "failed", "worker cancelled", None)
+        raise
+    except Exception as exc:
+        logger.exception("manager job %s crashed", job_id)
+        finish_job(job_id, "failed", str(exc)[:1000], None)
+    finally:
+        _inflight_job_keys.discard(key)
+        sem.release()
+
+
+async def jobs_worker(app: Application) -> None:
+    """Диспетчер делегированных задач: claim'ит pending-задачи и запускает их
+    параллельными тасками, ограниченными семафором (JARVIS_JOBS_CONCURRENCY,
+    дефолт 5). Задачи РАЗНЫХ топиков идут одновременно; задачи ОДНОГО топика
+    сериализуются (исключение busy-топиков при claim + per-topic лок).
+
+    Раньше воркер был один и await'ил каждую задачу до конца — длинный ресёрч в
+    одном топике блокировал делегирование во все остальные. Теперь не блокирует.
     """
-    logger.info("jobs_worker started")
+    concurrency = _env_int("JARVIS_JOBS_CONCURRENCY", 5, 1)
+    sem = asyncio.Semaphore(concurrency)
+    tasks: set[asyncio.Task] = set()
+    logger.info("jobs_worker started (concurrency=%d)", concurrency)
     while True:
+        # acquired: держим ли мы слот, который ещё не передан таске. Гарантирует
+        # освобождение слота на любом пути ошибки (иначе пул бы протекал).
+        acquired = False
         try:
-            job = claim_next_job()
+            # Ждём свободный слот ДО claim'а — задача не помечается in_progress,
+            # пока её некому выполнять (нет осиротевших claimed-but-idle задач).
+            await sem.acquire()
+            acquired = True
+            job = claim_next_job(exclude_keys=frozenset(_inflight_job_keys))
             if job is None:
+                sem.release()
+                acquired = False
                 await asyncio.sleep(2.0)
                 continue
-            try:
-                ok, msg_id, err_text = await _run_manager_job(app, job)
-                finish_job(
-                    job["id"], "done" if ok else "failed",
-                    None if ok else (err_text or "engine returned no usable reply"),
-                    msg_id,
-                )
-            except Exception as exc:
-                logger.exception("manager job %s crashed", job["id"])
-                finish_job(job["id"], "failed", str(exc)[:1000], None)
+            key = (job["chat_id"], job["thread_id"])
+            _inflight_job_keys.add(key)
+            t = asyncio.create_task(_run_job_slot(app, job, key, sem))
+            acquired = False  # владение слотом перешло к таске (release в её finally)
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
         except asyncio.CancelledError:
-            logger.info("jobs_worker cancelled")
+            if acquired:
+                sem.release()
+            logger.info("jobs_worker cancelled; cancelling %d in-flight job(s)", len(tasks))
+            for t in list(tasks):
+                t.cancel()
             raise
         except Exception:
-            logger.exception("jobs_worker loop crashed; sleeping 5s")
+            if acquired:
+                sem.release()
+            logger.exception("jobs_worker dispatcher crashed; sleeping 5s")
             await asyncio.sleep(5.0)
 
 
