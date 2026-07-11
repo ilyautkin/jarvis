@@ -616,7 +616,12 @@ def manager_create_topic(
         "without manual cleanup.\n"
         "as_user=False: plain sendMessage (notice / FYI), no LLM cycle. Use "
         "this for short notifications to other topics (e.g. «вопрос #ask_N "
-        "в топике X — загляни»)."
+        "в топике X — загляни»).\n"
+        "parse_mode='HTML' renders <b>, <i> and <a href=\"URL\">text</a> — use it "
+        "when publishing formatted content (news digest and the like), so links "
+        "hide behind words instead of showing raw URLs. Only with as_user=False. "
+        "If Telegram rejects the markup, the message is re-sent as plain text "
+        "rather than lost."
     ),
 )
 def manager_send(
@@ -625,6 +630,7 @@ def manager_send(
     chat_id: int | None = None,
     as_user: bool = True,
     delay_seconds: int = 0,
+    parse_mode: str | None = None,
 ) -> dict[str, Any]:
     """Queue or deliver a message into the topic."""
     text = text.strip()
@@ -705,7 +711,20 @@ def manager_send(
         "text": text,
         "message_thread_id": thread_id,
     }
-    result = _telegram_api("sendMessage", params)
+    if parse_mode:
+        params["parse_mode"] = parse_mode
+    try:
+        result = _telegram_api("sendMessage", params)
+    except RuntimeError:
+        # Кривая разметка не должна съедать сообщение целиком: у агента может
+        # не сойтись тег, и тогда Telegram отвергает весь текст. Лучше отдать
+        # содержимое как есть, чем потерять его.
+        if not parse_mode:
+            raise
+        logger.warning("manager_send: %s markup rejected, retrying as plain text",
+                       parse_mode)
+        params.pop("parse_mode")
+        result = _telegram_api("sendMessage", params)
     msg_id = int(result["message_id"])
     with _connect() as conn:
         conn.execute(
