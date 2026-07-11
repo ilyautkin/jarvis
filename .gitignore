@@ -33,3 +33,6 @@ bot_state.db
 
 # Logs
 *.log
+
+# CodeGraph — локальный индекс кода (SQLite), не коммитим
+.codegraph/
