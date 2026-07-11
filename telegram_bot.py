@@ -22,7 +22,7 @@ import sqlite3
 import asyncio
 import logging
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from telegram import (
     BotCommand,
@@ -313,6 +313,18 @@ def init_db() -> None:
                 logger.info("adding 'last_activity_at' column to sessions")
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN last_activity_at TEXT"
+                )
+            # Idempotent миграция: session_started_at — когда открыт текущий сеанс.
+            # Нужен, чтобы понять, не изменились ли с тех пор инструкции проекта
+            # (AGENTS.md / CLAUDE.md): движки читают их при СТАРТЕ сессии, и без
+            # этой проверки правка инструкций молча не действует — агент до конца
+            # сеанса работает по версии, прочитанной когда-то давно.
+            cols_now = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+            if cols_now and "session_started_at" not in cols_now:
+                _backup_db_once()
+                logger.info("adding 'session_started_at' column to sessions")
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN session_started_at TEXT"
                 )
         conn.execute(
             """
@@ -1118,6 +1130,17 @@ def reset_session(chat_id: int, thread_id: int) -> tuple[str, str | None, str]:
 # следующем сообщении, чтобы не плодить пустые сессии.
 
 
+def mark_session_start(chat_id: int, thread_id: int) -> None:
+    """Запомнить, когда открыт сеанс. По этой метке видно, не изменились ли с тех
+    пор инструкции проекта (движок читает их только при старте сессии)."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE sessions SET session_started_at = ? "
+            "WHERE chat_id = ? AND thread_id = ?",
+            (datetime.utcnow().isoformat(), chat_id, thread_id),
+        )
+
+
 def touch_session(chat_id: int, thread_id: int) -> None:
     """Отметить активность в топике — продлевает текущий сеанс."""
     now = datetime.utcnow().isoformat()
@@ -1186,18 +1209,54 @@ def _session_state_line(key: tuple[int, int]) -> str:
     return f"открыт, простой {idle_min} мин, закроется через {left} мин"
 
 
+INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
+
+
+def _instructions_changed(cwd: str | None, started_at: str | None) -> bool:
+    """Изменились ли инструкции проекта с момента открытия сеанса.
+
+    Движки читают AGENTS.md / CLAUDE.md при СТАРТЕ сессии. Пока сеанс жив, правка
+    инструкций молча не действует: агент до конца сеанса работает по версии,
+    прочитанной когда-то давно. Это тихая ловушка — правишь файл, перезапускаешь
+    задачу, а поведение прежнее, и непонятно почему (напоролись 2026-07-11 на
+    новостном топике: правки формата дайджеста не доходили до агента).
+
+    Поэтому: инструкции новее сеанса → сеанс переоткрываем.
+    """
+    if not cwd or not started_at:
+        return False
+    try:
+        # session_started_at пишется в UTC, а getmtime отдаёт epoch. Без явного
+        # tzinfo naive-строка трактуется как ЛОКАЛЬНОЕ время — и в UTC+3 сеанс
+        # переоткрывался бы на каждом сообщении.
+        started = datetime.fromisoformat(started_at).replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return False
+    for name in INSTRUCTION_FILES:
+        path = os.path.join(cwd, name)
+        try:
+            if os.path.getmtime(path) > started:
+                logger.info("instructions changed: %s newer than session start", path)
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def ensure_active_session(
     chat_id: int, thread_id: int,
 ) -> tuple[str, str | None, str, bool]:
     """Сеанс топика для текущего сообщения: (session_id, cwd, engine, opened_new).
 
-    Если прошлый сеанс закрыт или протух — открывает новый (новый session_id,
-    cwd/движок/модель сохраняются). opened_new=True, чтобы вызывающий сообщил
-    об этом пользователю.
+    Новый сеанс открывается, если прошлый закрыт, протух ИЛИ если изменились
+    инструкции проекта (их движок читает только при старте сессии).
+    opened_new=True, чтобы вызывающий сообщил об этом пользователю.
     """
     with _db() as conn:
         row = conn.execute(
-            "SELECT last_activity_at FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            "SELECT last_activity_at, cwd, session_started_at FROM sessions "
+            "WHERE chat_id = ? AND thread_id = ?",
             (chat_id, thread_id),
         ).fetchone()
 
@@ -1205,19 +1264,27 @@ def ensure_active_session(
         # Первое сообщение в топике: get_session заведёт запись.
         session_id, cwd, engine_name = get_session(chat_id, thread_id)
         touch_session(chat_id, thread_id)
+        mark_session_start(chat_id, thread_id)
         logger.info("session opened (new topic): key=%s session=%s",
                     (chat_id, thread_id), session_id)
         return session_id, cwd, engine_name, True
 
-    if _session_is_stale(row[0]):
+    stale = _session_is_stale(row[0])
+    fresh_instructions = not stale and _instructions_changed(row[1], row[2])
+
+    if stale or fresh_instructions:
         # Делегированные задачи (jobs) переоткрытию сеанса не мешают: job несёт
         # полный текст задачи и не зависит от контекста прошлого сеанса, а
         # Менеджер поднимает своё состояние через manager_inbox.
         session_id, cwd, engine_name = reset_session(chat_id, thread_id)
         touch_session(chat_id, thread_id)
-        logger.info("session opened (previous %s): key=%s session=%s",
-                    "closed" if row[0] is None else "stale",
-                    (chat_id, thread_id), session_id)
+        mark_session_start(chat_id, thread_id)
+        if fresh_instructions:
+            reason = "instructions changed"
+        else:
+            reason = "closed" if row[0] is None else "stale"
+        logger.info("session opened (%s): key=%s session=%s",
+                    reason, (chat_id, thread_id), session_id)
         return session_id, cwd, engine_name, True
 
     session_id, cwd, engine_name = get_session(chat_id, thread_id)
