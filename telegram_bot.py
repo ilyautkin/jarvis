@@ -1832,9 +1832,46 @@ class ProgressJournal:
             logger.warning("journal: giving up on updates", exc_info=True)
             self._broken = True
 
-    async def finish(self) -> None:
-        """Оставить журнал в топике. Пустой (агент не сделал ни шага) — убрать."""
-        if self.msg is None or self.total_steps:
+    def _strip_final_echo(self, final_text: str) -> None:
+        """Убрать из хвоста журнала текст, который сейчас уйдёт финальным ответом.
+
+        Движки шлют в промежуточный поток и текстовые блоки ассистента — для
+        claude это вообще единственная видимая часть его рассуждений (блок
+        thinking приходит пустым), так что выбрасывать их нельзя. Но ПОСЛЕДНИЙ
+        такой блок и есть финальный ответ: без этой чистки он виден дважды —
+        в журнале и отдельным сообщением.
+
+        Режем только хвост и только строки без префикса шага (🔧 / 💭):
+        промежуточные реплики агента («сейчас проверю X») в финал не входят и
+        должны остаться.
+        """
+        final = (final_text or "").strip()
+        if not final:
+            return
+        while self.lines:
+            last = self.lines[-1]
+            if last.startswith(("🔧", "💭")):
+                break
+            # Строки в журнале обрезаны (JOURNAL_LINE_CHARS), поэтому ищем
+            # вхождение, а не равенство.
+            if last and last in final:
+                self.lines.pop()
+                self.total_steps -= 1
+                continue
+            break
+
+    async def finish(self, final_text: str | None = None) -> None:
+        """Оставить журнал в топике, вычистив эхо финального ответа.
+
+        Журнал без единого шага (или из одного лишь финального текста) —
+        удаляем: он ничего не добавляет к ответу.
+        """
+        if self.msg is None:
+            return
+        if final_text:
+            self._strip_final_echo(final_text)
+        if self.total_steps > 0 and self.lines:
+            await self._flush()   # перерисовать без вырезанного хвоста
             return
         try:
             await self.msg.delete()
@@ -3121,7 +3158,7 @@ async def _process_prompt(
             logger.exception("llm call crashed: key=%s engine=%s", key, engine.name)
             ok, final_text = False, f"Внутренняя ошибка: {exc}"
 
-        await journal.finish()
+        await journal.finish(final_text)
 
         if not ok and not final_text.strip():
             logger.info("llm call stopped without final reply: key=%s engine=%s", key, engine.name)
@@ -3191,7 +3228,7 @@ async def _run_spawn(update: Update, user_text: str) -> None:
                          key, spawn_id, engine.name)
         ok, final_text = False, f"Внутренняя ошибка: {exc}"
 
-    await journal.finish()
+    await journal.finish(final_text)
 
     if not ok and not final_text.strip():
         logger.info("spawn stopped without final reply: key=%s spawn=%s engine=%s",
@@ -3395,7 +3432,7 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
                 watcher_task.cancel()
 
         if journal is not None:
-            await journal.finish()
+            await journal.finish(final_text)
 
         if interrupted:
             # Менеджер прервал. Доделаем то немногое что успели увидеть в
