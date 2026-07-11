@@ -186,6 +186,7 @@ class ClaudeEngine:
             *mcp_flags,
             *model_flags,
             *session_flags,
+            "--",
             prompt,
         ]
 
@@ -273,6 +274,13 @@ class ClaudeEngine:
                             txt = (block.get("text") or "").strip()
                             if txt:
                                 buffer_intermediate.append(txt[:800])
+                        elif btype == "thinking":
+                            # Claude Code НЕ отдаёт текст рассуждений наружу: поле
+                            # `thinking` всегда пустое, приходит только signature
+                            # (проверено на 2.1.207, в т.ч. с
+                            # --include-partial-messages и --effort high). Показать
+                            # можем лишь сам факт — что ход включал размышление.
+                            buffer_intermediate.append("💭 размышляет…")
                         elif btype == "tool_use":
                             name = block.get("name", "?")
                             inp = block.get("input") or {}

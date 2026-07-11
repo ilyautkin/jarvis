@@ -383,9 +383,11 @@ class CodexEngine:
                             continue
                         txt = (item.get("text") or "").strip()
                         if txt:
-                            # Показываем первую строку рассуждений.
-                            first = txt.splitlines()[0][:300]
-                            buffer_intermediate.append(f"💭 {first}")
+                            # В отличие от claude, codex отдаёт рассуждения текстом.
+                            # Раньше брали одну первую строку — остальное терялось
+                            # в затираемом индикаторе. Теперь есть журнал хода, так
+                            # что показываем рассуждение целиком (в разумных рамках).
+                            buffer_intermediate.append(f"💭 {txt[:800]}")
                             await flush_intermediate()
                 # turn.started / turn.completed — игнорируем, нам достаточно item.*.
 

@@ -1112,6 +1112,148 @@ async def manager_wait_reply(
         await asyncio.sleep(poll_interval)
 
 
+def _ask_keyboard(ask_id: int, options: list[str]) -> dict[str, Any]:
+    """Inline-клавиатура вариантов. В callback_data идёт ИНДЕКС, а не текст:
+    Telegram ограничивает callback_data 64 байтами."""
+    return {
+        "inline_keyboard": [
+            [{"text": opt[:64], "callback_data": f"ask:{ask_id}:{idx}"}]
+            for idx, opt in enumerate(options)
+        ]
+    }
+
+
+@mcp.tool(
+    name="ask_user",
+    description=(
+        "Ask the human a question in his Telegram topic and BLOCK until he "
+        "answers. Use this whenever you need a decision only he can make: "
+        "before destructive or irreversible actions (deleting files, DROP/"
+        "DELETE, force-push, anything on production), when the task is "
+        "ambiguous and guessing would waste work, or when you must choose "
+        "between options with real trade-offs.\n\n"
+        "Pass `options` to render tappable buttons — prefer this over free-form "
+        "questions, it is much faster for him to answer. He can always reply "
+        "with text instead, so keep questions answerable either way.\n\n"
+        "Returns {status: 'answered', answer, option_index, via} once he "
+        "responds, or {status: 'timed_out', answer: <default>} if he does not "
+        "answer within `timeout_seconds`. On timeout do NOT assume consent: "
+        "treat it as 'no answer' and stop, unless you passed an explicit "
+        "`default`.\n\n"
+        "Do not use this for questions you can answer yourself by reading the "
+        "code, running a command, or checking git — he is not a lookup service."
+    ),
+)
+async def ask_user(
+    question: str,
+    thread_id: int,
+    options: list[str] | None = None,
+    chat_id: int | None = None,
+    timeout_seconds: int = 600,
+    default: str | None = None,
+    poll_interval: float = 2.0,
+) -> dict[str, Any]:
+    """Post a question into the topic and wait for the human's answer."""
+    question = (question or "").strip()
+    if not question:
+        return {"status": "error", "error": "question is empty"}
+    if timeout_seconds <= 0 or timeout_seconds > 3600:
+        timeout_seconds = 600
+    poll_interval = min(max(poll_interval, 1.0), 30.0)
+    options = [str(o).strip() for o in (options or []) if str(o).strip()][:8]
+    target_chat_id = chat_id if chat_id is not None else _default_chat_id()
+    now = datetime.utcnow().isoformat()
+
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO ask_requests(chat_id, thread_id, question, options_json, "
+            "status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+            (
+                target_chat_id, thread_id, question,
+                json.dumps(options, ensure_ascii=False) if options else None,
+                now,
+            ),
+        )
+        ask_id = cur.lastrowid
+
+    body = f"❓ {question}\n\n"
+    body += (
+        "Выбери вариант или ответь сообщением."
+        if options else "Ответь сообщением в этот топик."
+    )
+    params: dict[str, Any] = {
+        "chat_id": target_chat_id,
+        "text": body,
+        "message_thread_id": thread_id,
+    }
+    if options:
+        params["reply_markup"] = _ask_keyboard(ask_id, options)
+
+    try:
+        sent = _telegram_api("sendMessage", params)
+    except RuntimeError as exc:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE ask_requests SET status = 'failed' WHERE id = ?", (ask_id,),
+            )
+        return {"status": "error", "error": f"failed to post question: {exc}"}
+
+    tg_msg_id = sent.get("message_id")
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE ask_requests SET telegram_message_id = ? WHERE id = ?",
+            (tg_msg_id, ask_id),
+        )
+    logger.info("ask_user #%s posted to thread=%s (options=%d)",
+                ask_id, thread_id, len(options))
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        with _connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT status, answer, option_index, via FROM ask_requests WHERE id = ?",
+                (ask_id,),
+            ).fetchone()
+        if row is not None and row["status"] == "answered":
+            logger.info("ask_user #%s answered via %s", ask_id, row["via"])
+            return {
+                "status": "answered",
+                "ask_id": ask_id,
+                "answer": row["answer"],
+                "option_index": row["option_index"],
+                "via": row["via"],
+            }
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(poll_interval)
+
+    # Таймаут: закрываем вопрос, гасим кнопки — чтобы по протухшему нельзя было
+    # кликнуть и чтобы следующее сообщение в топик не съелось как «ответ».
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE ask_requests SET status = 'timed_out', answered_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (datetime.utcnow().isoformat(), ask_id),
+        )
+    if tg_msg_id:
+        try:
+            _telegram_api("editMessageText", {
+                "chat_id": target_chat_id,
+                "message_id": tg_msg_id,
+                "text": f"❓ {question}\n\n⏰ Вопрос истёк — ответа не было.",
+            })
+        except RuntimeError:
+            pass
+    logger.info("ask_user #%s timed out after %ss", ask_id, timeout_seconds)
+    return {
+        "status": "timed_out",
+        "ask_id": ask_id,
+        "answer": default,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
 @mcp.tool(
     name="manager_inbox",
     description=(

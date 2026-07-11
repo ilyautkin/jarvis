@@ -34,7 +34,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -80,12 +80,10 @@ MSG_LIMIT = 3500           # порог отправки ответа как д�
 TG_HARD_LIMIT = 4096       # жёсткий лимит Telegram
 TG_FILE_LIMIT_MB = 50      # Telegram Bot API лимит на sendDocument
 
-AUTOCOMPACT_DEFAULT = os.environ.get("JARVIS_AUTOCOMPACT", "1").strip().lower() not in {
-    "0", "false", "no", "off",
-}
-AUTOCOMPACT_WARN_TOKENS = _int_env_raw("JARVIS_AUTOCOMPACT_WARN_TOKENS", 200000)
-AUTOCOMPACT_MAX_TOKENS = _int_env_raw("JARVIS_AUTOCOMPACT_MAX_TOKENS", 250000)
-AUTOCOMPACT_SUMMARY_CHARS = _int_env_raw("JARVIS_AUTOCOMPACT_SUMMARY_CHARS", 4000)
+# Сеанс = окно терминала. Открывается первым сообщением, закрывается командой
+# /close или сам — после SESSION_IDLE_MINUTES без активности в топике. Топик
+# (cwd, движок, модель) переживает закрытие, контекст сессии — нет.
+SESSION_IDLE_MINUTES = _int_env_raw("JARVIS_SESSION_IDLE_MINUTES", 180)
 
 # Маркер для отправки файлов из LLM-сессии: [[FILE: /abs/path]] или [[FILE: /path | подпись]].
 # Должен стоять на отдельной строке (но допускаются пробелы вокруг).
@@ -105,7 +103,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def build_system_prefix(effective_cwd: str, mcp_playwright: bool = False) -> str:
+def build_system_prefix(
+    effective_cwd: str,
+    mcp_playwright: bool = False,
+    key: tuple[int, int] | None = None,
+) -> str:
     """Постоянный [SYSTEM:]-блок для движка.
 
     Раньше клеился в тело КАЖDОГО user-сообщения и копился в транскрипте.
@@ -113,21 +115,46 @@ def build_system_prefix(effective_cwd: str, mcp_playwright: bool = False) -> str
     codex/opencode — префиксом только на новой сессии) — один раз на сессию.
     Строка про браузер добавляется ТОЛЬКО когда Playwright реально подключён
     (mcp_playwright), иначе не зовём модель пользоваться недоступными тулами.
+
+    `key` — (chat_id, thread_id) топика. Нужен движку, чтобы он мог сам поднять
+    историю топика через manager_inbox: сессия живёт один сеанс, а переписка
+    переживает его в messages_log.
     """
     lines = [
         "[SYSTEM: Сообщение пришло от пользователя через Telegram-бота Jarvis.",
         f"Ты работаешь в проекте {effective_cwd}. Используй memory-правила из "
         "~/.claude/projects/-home-shevartv/memory/.",
     ]
+    if key is not None:
+        lines.append(
+            f"Твой топик: chat_id={key[0]}, thread_id={key[1]}. Сессия живёт один "
+            "сеанс и не помнит прошлые — но переписка топика сохраняется. Если "
+            "нужен контекст прошлых разговоров, подними его сам через MCP-инструмент "
+            f"manager_inbox(chat_id={key[0]}, thread_id={key[1]})."
+        )
     if mcp_playwright:
         lines.append(
             "Если нужно работать с браузером, используй Playwright MCP browser_* tools, "
             "когда они доступны; если MCP недоступен, скажи об этом и выбери рабочий fallback."
         )
-    lines.append(
-        "Опасные действия (удаления, DELETE/DROP, действия на проде, sudo, push --force) — "
-        "переспрашивай.]"
-    )
+    if key is not None:
+        lines.append(
+            "Пользователь НЕ видит этот ход в реальном времени и не может тебя "
+            "перебить — единственный способ что-то у него спросить и дождаться "
+            f"ответа: MCP-инструмент ask_user(question, thread_id={key[1]}, "
+            "options=[...]). Он блокирует тебя до ответа. Обязательно спрашивай "
+            "ПЕРЕД опасными действиями (удаления, DELETE/DROP, sudo, push --force, "
+            "что-либо на проде) и когда задача допускает разные толкования, а "
+            "угадывание обесценит работу. Давай варианты в options — по ним "
+            "отвечать быстрее. Не спрашивай о том, что можешь выяснить сам "
+            "(прочитать код, запустить команду, посмотреть git)."
+        )
+    else:
+        lines.append(
+            "Опасные действия (удаления, DELETE/DROP, действия на проде, sudo, "
+            "push --force) — переспрашивай."
+        )
+    lines[-1] += "]"
     return "\n".join(lines)
 
 
@@ -266,14 +293,26 @@ def init_db() -> None:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN mcp_playwright INTEGER NOT NULL DEFAULT 0"
                 )
-            # Idempotent миграция: autocompact_enabled — per-topic override.
-            # NULL = наследовать JARVIS_AUTOCOMPACT, 0/1 = явно выключено/включено.
+            # Idempotent миграция: autocompact_enabled — легаси, автокомпакт
+            # убран вместе с переходом на сеансы. Колонку не используем и не
+            # удаляем (чтобы не терять данные на откате).
             cols_now = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
             if cols_now and "autocompact_enabled" not in cols_now:
                 _backup_db_once()
                 logger.info("adding 'autocompact_enabled' column to sessions")
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN autocompact_enabled INTEGER"
+                )
+            # Idempotent миграция: last_activity_at — время последнего сообщения
+            # в топике. По нему закрывается протухший сеанс (idle > порога).
+            # NULL у старых строк = сеанс считается протухшим при первом
+            # обращении, т.е. откроется новый — это и нужно.
+            cols_now = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+            if cols_now and "last_activity_at" not in cols_now:
+                _backup_db_once()
+                logger.info("adding 'last_activity_at' column to sessions")
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN last_activity_at TEXT"
                 )
         conn.execute(
             """
@@ -306,6 +345,31 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_log_topic_ts "
             "ON messages_log(chat_id, thread_id, ts)"
+        )
+        # Вопросы агента пользователю (MCP tool ask_user). Канал между двумя
+        # процессами: MCP-сервер пишет вопрос и поллит ответ, бот принимает
+        # ответ (нажатие кнопки или обычное сообщение в топик) и кладёт сюда.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ask_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL DEFAULT 0,
+                question TEXT NOT NULL,
+                options_json TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                answer TEXT,
+                option_index INTEGER,
+                via TEXT,
+                telegram_message_id INTEGER,
+                created_at TEXT NOT NULL,
+                answered_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ask_requests_pending "
+            "ON ask_requests(chat_id, thread_id, status, id)"
         )
         # Очередь задач от Менеджера (MCP tool manager_send as_user=True).
         # Worker внутри бота забирает pending и прокручивает их через
@@ -1042,6 +1106,125 @@ def reset_session(chat_id: int, thread_id: int) -> tuple[str, str | None, str]:
     return new_id, cwd, engine_name
 
 
+# ---------- Жизненный цикл сеанса ----------
+#
+# Сеанс — это окно терминала: открывается первым сообщением, закрывается /close
+# или по простою. Топик (cwd, движок, модель) переживает закрытие, контекст
+# сессии — нет; переписка остаётся в messages_log и доступна движку через
+# manager_inbox.
+#
+# Признак закрытого сеанса — last_activity_at IS NULL (session_id объявлен
+# NOT NULL, обнулить его нельзя). Новый session_id создаётся лениво, при
+# следующем сообщении, чтобы не плодить пустые сессии.
+
+
+def touch_session(chat_id: int, thread_id: int) -> None:
+    """Отметить активность в топике — продлевает текущий сеанс."""
+    now = datetime.utcnow().isoformat()
+    with _db() as conn:
+        conn.execute(
+            "UPDATE sessions SET last_activity_at = ?, updated_at = ? "
+            "WHERE chat_id = ? AND thread_id = ?",
+            (now, now, chat_id, thread_id),
+        )
+
+
+def close_session(chat_id: int, thread_id: int) -> bool:
+    """Закрыть сеанс топика. Возвращает False, если он и так был закрыт.
+
+    session_id не трогаем — он пересоздастся при следующем сообщении.
+    """
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT last_activity_at FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, thread_id),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return False
+        conn.execute(
+            "UPDATE sessions SET last_activity_at = NULL, updated_at = ? "
+            "WHERE chat_id = ? AND thread_id = ?",
+            (datetime.utcnow().isoformat(), chat_id, thread_id),
+        )
+    return True
+
+
+def _session_is_stale(last_activity_at: str | None) -> bool:
+    """Протух ли сеанс: закрыт (NULL) или простаивал дольше порога."""
+    if not last_activity_at:
+        return True
+    if SESSION_IDLE_MINUTES <= 0:
+        return False  # 0/отрицательное — авто-закрытие выключено
+    try:
+        last = datetime.fromisoformat(last_activity_at)
+    except ValueError:
+        logger.warning("bad last_activity_at=%r, treating session as stale",
+                       last_activity_at)
+        return True
+    return datetime.utcnow() - last > timedelta(minutes=SESSION_IDLE_MINUTES)
+
+
+def _session_state_line(key: tuple[int, int]) -> str:
+    """Человекочитаемое состояние сеанса для /session и /tokens."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT last_activity_at FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (key[0], key[1]),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return "закрыт (следующее сообщение откроет новый)"
+    if SESSION_IDLE_MINUTES <= 0:
+        return "открыт (авто-закрытие выключено)"
+    try:
+        last = datetime.fromisoformat(row[0])
+    except ValueError:
+        return "открыт (не удалось прочитать last_activity_at)"
+    idle_min = int((datetime.utcnow() - last).total_seconds() // 60)
+    left = SESSION_IDLE_MINUTES - idle_min
+    if left <= 0:
+        return "протух (следующее сообщение откроет новый)"
+    return f"открыт, простой {idle_min} мин, закроется через {left} мин"
+
+
+def ensure_active_session(
+    chat_id: int, thread_id: int,
+) -> tuple[str, str | None, str, bool]:
+    """Сеанс топика для текущего сообщения: (session_id, cwd, engine, opened_new).
+
+    Если прошлый сеанс закрыт или протух — открывает новый (новый session_id,
+    cwd/движок/модель сохраняются). opened_new=True, чтобы вызывающий сообщил
+    об этом пользователю.
+    """
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT last_activity_at FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, thread_id),
+        ).fetchone()
+
+    if row is None:
+        # Первое сообщение в топике: get_session заведёт запись.
+        session_id, cwd, engine_name = get_session(chat_id, thread_id)
+        touch_session(chat_id, thread_id)
+        logger.info("session opened (new topic): key=%s session=%s",
+                    (chat_id, thread_id), session_id)
+        return session_id, cwd, engine_name, True
+
+    if _session_is_stale(row[0]):
+        # Делегированные задачи (jobs) переоткрытию сеанса не мешают: job несёт
+        # полный текст задачи и не зависит от контекста прошлого сеанса, а
+        # Менеджер поднимает своё состояние через manager_inbox.
+        session_id, cwd, engine_name = reset_session(chat_id, thread_id)
+        touch_session(chat_id, thread_id)
+        logger.info("session opened (previous %s): key=%s session=%s",
+                    "closed" if row[0] is None else "stale",
+                    (chat_id, thread_id), session_id)
+        return session_id, cwd, engine_name, True
+
+    session_id, cwd, engine_name = get_session(chat_id, thread_id)
+    touch_session(chat_id, thread_id)
+    return session_id, cwd, engine_name, False
+
+
 def set_engine(
     chat_id: int, thread_id: int, new_engine_name: str, model: str | None = None,
 ) -> tuple[str, str | None]:
@@ -1090,45 +1273,6 @@ def get_mcp_playwright(chat_id: int, thread_id: int) -> bool:
             (chat_id, thread_id),
         ).fetchone()
     return bool(row[0]) if row and row[0] is not None else False
-
-
-def get_autocompact_enabled(chat_id: int, thread_id: int) -> bool:
-    """Per-topic autocompact flag. NULL means inherit env default."""
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT autocompact_enabled FROM sessions WHERE chat_id = ? AND thread_id = ?",
-            (chat_id, thread_id),
-        ).fetchone()
-    if not row or row[0] is None:
-        return AUTOCOMPACT_DEFAULT
-    return bool(row[0])
-
-
-def set_autocompact_enabled(chat_id: int, thread_id: int, enabled: bool | None) -> None:
-    """Set per-topic autocompact flag. None resets to env default."""
-    now = datetime.utcnow().isoformat()
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT cwd, engine FROM sessions WHERE chat_id = ? AND thread_id = ?",
-            (chat_id, thread_id),
-        ).fetchone()
-        value = None if enabled is None else (1 if enabled else 0)
-        if row is None:
-            engine_name = DEFAULT_ENGINE_NAME
-            conn.execute(
-                "INSERT INTO sessions(chat_id, thread_id, session_id, cwd, engine, "
-                "autocompact_enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    chat_id, thread_id, get_engine_by_name(engine_name).new_session_id(),
-                    None, engine_name, value, now,
-                ),
-            )
-        else:
-            conn.execute(
-                "UPDATE sessions SET autocompact_enabled = ?, updated_at = ? "
-                "WHERE chat_id = ? AND thread_id = ?",
-                (value, now, chat_id, thread_id),
-            )
 
 
 def set_mcp_playwright(chat_id: int, thread_id: int, enabled: bool) -> None:
@@ -1211,6 +1355,116 @@ def update_model_only(chat_id: int, thread_id: int, model: str | None) -> bool:
     return cur.rowcount == 1
 
 
+# ---------- Вопросы агента пользователю (ask_user) ----------
+#
+# Агент зовёт MCP-инструмент ask_user; тот пишет вопрос в ask_requests, шлёт его
+# в топик (с кнопками, если заданы варианты) и БЛОКИРУЕТСЯ, полля таблицу.
+# Ответ кладёт сюда бот — из нажатия кнопки или из обычного сообщения в топик.
+
+
+def get_pending_ask(chat_id: int, thread_id: int) -> dict | None:
+    """Незакрытый вопрос топика (последний, если их вдруг несколько)."""
+    with _db() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM ask_requests WHERE chat_id = ? AND thread_id = ? "
+            "AND status = 'pending' ORDER BY id DESC LIMIT 1",
+            (chat_id, thread_id),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def answer_ask(
+    ask_id: int, answer: str, via: str, option_index: int | None = None,
+) -> bool:
+    """Записать ответ. False, если вопрос уже закрыт (ответили дважды/таймаут)."""
+    with _db() as conn:
+        cur = conn.execute(
+            "UPDATE ask_requests SET status = 'answered', answer = ?, "
+            "option_index = ?, via = ?, answered_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (answer, option_index, via, datetime.utcnow().isoformat(), ask_id),
+        )
+    return cur.rowcount == 1
+
+
+def ask_question_text(question: str, options: list[str] | None) -> str:
+    """Как вопрос выглядит в топике. Используется и ботом, и MCP-сервером."""
+    body = f"❓ {question}"
+    if not options:
+        body += "\n\n<i>Ответь сообщением в этот топик.</i>"
+    else:
+        body += "\n\n<i>Выбери вариант или ответь сообщением.</i>"
+    return body
+
+
+async def _mark_ask_answered(chat, ask: dict, answer: str) -> None:
+    """Погасить кнопки у заданного вопроса и показать выбранный ответ."""
+    tg_msg_id = ask.get("telegram_message_id")
+    if not tg_msg_id:
+        return
+    body = (
+        f"❓ {_html_escape(ask['question'])}\n\n"
+        f"✅ <b>Ответ:</b> {_html_escape(answer)}"
+    )
+    try:
+        await chat.get_bot().edit_message_text(
+            chat_id=ask["chat_id"], message_id=tg_msg_id, text=body,
+            parse_mode=ParseMode.HTML, reply_markup=None,
+        )
+    except Exception:
+        # Сообщение могли удалить/изменить — ответ уже в БД, агент его получит.
+        logger.warning("ask #%s: failed to update question message", ask["id"])
+
+
+async def on_ask_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Нажата кнопка варианта. callback_data: ask:<ask_id>:<option_index>."""
+    query = update.callback_query
+    if query is None or not (query.data or "").startswith("ask:"):
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        return
+    try:
+        ask_id = int(parts[1])
+        option_index = int(parts[2])
+    except ValueError:
+        return
+
+    with _db() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM ask_requests WHERE id = ?", (ask_id,)).fetchone()
+    if row is None:
+        await query.answer("Вопрос не найден", show_alert=False)
+        return
+    ask = dict(row)
+
+    options = json.loads(ask["options_json"] or "[]")
+    if not 0 <= option_index < len(options):
+        await query.answer("Неизвестный вариант", show_alert=False)
+        return
+    answer = options[option_index]
+
+    if not answer_ask(ask_id, answer, via="button", option_index=option_index):
+        # Уже отвечено текстом или истёк таймаут.
+        await query.answer("Вопрос уже закрыт", show_alert=False)
+        return
+
+    logger.info("ask #%s answered by button: %r", ask_id, answer)
+    try:
+        await query.answer(f"Принято: {answer}"[:200])
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(
+            f"❓ {_html_escape(ask['question'])}\n\n"
+            f"✅ <b>Ответ:</b> {_html_escape(answer)}",
+            parse_mode=ParseMode.HTML, reply_markup=None,
+        )
+    except Exception:
+        logger.warning("ask #%s: failed to edit question message", ask_id)
+
+
 def set_pending_summary(chat_id: int, thread_id: int, summary: str) -> None:
     """Сохраняет резюме предыдущей сессии — будет доставлено в первый prompt
     после переключения движка."""
@@ -1222,31 +1476,41 @@ def set_pending_summary(chat_id: int, thread_id: int, summary: str) -> None:
         )
 
 
-def pop_pending_summary(chat_id: int, thread_id: int) -> str | None:
-    """Atomically: вернуть pending_summary и очистить его. Возвращает None,
-    если резюме нет."""
+def get_pending_summary(chat_id: int, thread_id: int) -> str | None:
+    """Вернуть pending_summary без очистки.
+
+    Резюме удаляем только после успешного первого хода новой сессии, иначе при
+    падении этого хода контекст потеряется без возможности ретрая.
+    """
     with _db() as conn:
         row = conn.execute(
             "SELECT pending_summary FROM sessions WHERE chat_id = ? AND thread_id = ?",
             (chat_id, thread_id),
         ).fetchone()
-        if not row or not row[0]:
-            return None
-        summary = row[0]
+    if not row or not row[0]:
+        return None
+    return row[0]
+
+
+def clear_pending_summary(chat_id: int, thread_id: int) -> None:
+    """Очистить pending_summary после того, как summary уже успешно попало
+    в новый ход LLM-сессии."""
+    with _db() as conn:
         conn.execute(
             "UPDATE sessions SET pending_summary = NULL, updated_at = ? "
             "WHERE chat_id = ? AND thread_id = ?",
             (datetime.utcnow().isoformat(), chat_id, thread_id),
         )
-        return summary
 
 
-_TRANSFER_MARKER_PREFIX = '{"transfer_requested":true'
-
-
-def _is_transfer_marker(pending: str) -> bool:
-    """True если pending_summary — JSON-маркер запроса на генерацию summary."""
-    return pending.startswith(_TRANSFER_MARKER_PREFIX)
+def _transfer_marker(old_engine_name: str) -> str:
+    """JSON-маркер «контекст просили перенести». Кладётся в pending_summary при
+    смене движка и разворачивается в указание прочитать историю (см.
+    _resolve_pending_summary) при первом сообщении новому движку."""
+    return json.dumps(
+        {"transfer_requested": True, "old_engine": old_engine_name},
+        ensure_ascii=False,
+    )
 
 
 def _parse_transfer_marker(pending: str) -> dict | None:
@@ -1261,47 +1525,39 @@ def _parse_transfer_marker(pending: str) -> dict | None:
     return None
 
 
+def build_context_handoff(key: tuple[int, int], old_engine_name: str) -> str:
+    """Указание новому движку поднять контекст самому.
+
+    Раньше здесь старый движок гонялся за резюме — полный проход по всей
+    истории, самый дорогой вызов из возможных. Теперь платит только новый
+    движок и только за то, что реально прочитал: историю топика он берёт через
+    manager_inbox, рабочее состояние — из кода и git.
+    """
+    chat_id, thread_id = key
+    return (
+        f"Ты подхватываешь диалог, который до тебя вёл другой агент "
+        f"({old_engine_name}). Его контекст тебе НЕ передан.\n"
+        f"Прежде чем отвечать, подними историю сам: вызови MCP-инструмент "
+        f"manager_inbox(chat_id={chat_id}, thread_id={thread_id}) и прочитай "
+        f"последние сообщения — столько, сколько нужно, чтобы понять задачу и "
+        f"на чём остановились. Рабочее состояние сверяй с кодом и git, а не с "
+        f"пересказом."
+    )
+
+
 async def _resolve_pending_summary(
     key: tuple[int, int], pending: str,
 ) -> str | None:
-    """Если pending — маркер transfer_requested: вызывает старый движок для
-    генерации summary, сохраняет его в БД и возвращает текст summary.
-    Иначе возвращает pending как есть (готовое summary)."""
+    """Маркер transfer_requested → указание новому движку прочитать историю
+    топика. Легаси-строки (готовое summary из старых версий) отдаём как есть."""
     marker = _parse_transfer_marker(pending)
     if marker is None:
-        return pending  # обычное summary, уже готово
+        return pending  # легаси: реальное summary, уже лежит в БД
 
-    chat_id, thread_id = key
     old_engine_name = marker["old_engine"]
-    old_session_id = marker.get("old_session_id")
-    _, cwd, _ = get_session(*key)
-    old_model = marker.get("old_model")
-
-    logger.info(
-        "resolving transfer marker: key=%s old_engine=%s old_sid=%s",
-        key, old_engine_name, old_session_id,
-    )
-
-    # Попросим старый движок выдать summary. Если старый движок недоступен —
-    # просто вернём None (контекст не перенесётся, но сессия уже переключена).
-    try:
-        get_engine_by_name(old_engine_name)
-    except Exception:
-        logger.warning(
-            "old engine %s unavailable for transfer marker resolution key=%s",
-            old_engine_name, key,
-        )
-        return None
-
-    summary = await _generate_handoff_summary(key, old_engine_name, cwd, old_model)
-    if summary:
-        set_pending_summary(chat_id, thread_id, summary)
-        logger.info(
-            "transfer marker resolved: stored real summary for key=%s (%d chars)",
-            key, len(summary),
-        )
-        return summary
-    return None
+    logger.info("resolving transfer marker: key=%s old_engine=%s",
+                key, old_engine_name)
+    return build_context_handoff(key, old_engine_name)
 
 
 def set_cwd(chat_id: int, thread_id: int, cwd: str) -> None:
@@ -1484,6 +1740,108 @@ async def send_document_to_topic(chat, thread_id: int, document, **kwargs):
     return await chat.send_document(document=document, **kwargs)
 
 
+JOURNAL_MAX_CHARS = 3400   # запас до TG_HARD_LIMIT на HTML-разметку
+JOURNAL_LINE_CHARS = 400   # длинную строку шага режем — журнал, не транскрипт
+
+
+class ProgressJournal:
+    """Журнал хода работы агента — одно накопительное сообщение в топике.
+
+    Раньше промежуточные шаги писались в сообщение-индикатор: каждый апдейт
+    ЗАТИРАЛ предыдущий, а в конце индикатор удалялся — так что ход работы
+    (какие команды агент выполнял, что читал, о чём рассуждал) исчезал целиком.
+    Теперь шаги дописываются и остаются в топике после ответа.
+
+    Когда сообщение упирается в лимит Telegram, журнал продолжается в новом;
+    заполненное остаётся в истории как есть. Если агент не сделал ни одного
+    шага, стартовая плашка удаляется, чтобы не мусорить в топике.
+    """
+
+    def __init__(self, chat, thread_id: int, prefix: str = "",
+                 header: str = "⏳ Думаю..."):
+        self.chat = chat
+        self.thread_id = thread_id
+        self.prefix = prefix
+        self.header = header
+        self.msg = None
+        self.lines: list[str] = []   # строки ТЕКУЩЕГО сообщения
+        self.total_steps = 0
+        self._broken = False         # Telegram не даёт писать — тихо выключаемся
+
+    async def start(self) -> None:
+        try:
+            self.msg = await send_to_topic(
+                self.chat, self.thread_id, f"{self.prefix}{self.header}",
+            )
+        except Exception:
+            logger.exception("journal: failed to post header")
+            self.msg = None
+
+    def _render(self) -> str:
+        return self.prefix + "\n".join(self.lines)
+
+    async def append(self, chunk: str) -> None:
+        """Дописать шаги. `chunk` — только новое с прошлого флеша (движки шлют
+        дельту, а не весь буфер)."""
+        if self._broken:
+            return
+        new_lines = [
+            line.strip()[:JOURNAL_LINE_CHARS]
+            for line in chunk.splitlines() if line.strip()
+        ]
+        if not new_lines:
+            return
+
+        for line in new_lines:
+            # Не влезает в текущее сообщение — начинаем новое, старое остаётся.
+            if self.lines and len(self._render()) + len(line) + 1 > JOURNAL_MAX_CHARS:
+                self.msg = None
+                self.lines = []
+            self.lines.append(line)
+            self.total_steps += 1
+
+        await self._flush()
+
+    async def _flush(self) -> None:
+        body = md_to_html(self._render())
+        try:
+            if self.msg is None:
+                self.msg = await _send_with_html_fallback(
+                    self.chat.send_message, body,
+                    **({"message_thread_id": self.thread_id} if self.thread_id else {}),
+                )
+                return
+            try:
+                await self.msg.edit_text(body, parse_mode=ParseMode.HTML)
+            except BadRequest as exc:
+                text = str(exc).lower()
+                if "not modified" in text:
+                    return
+                if "parse" in text or "entit" in text:
+                    await self.msg.edit_text(self._render())
+                    return
+                raise
+        except RetryAfter:
+            # Telegram троттлит правки. Пропускаем ЭТОТ апдейт — строки уже в
+            # self.lines и уедут со следующим флешем. Глушить журнал нельзя:
+            # на длинном ходе троттлинг — норма, а не отказ.
+            logger.info("journal: throttled by Telegram, skipping this update")
+        except Exception:
+            # Удалённый топик, потеря прав, слишком длинное сообщение — журнал
+            # не критичен, ответ пользователю важнее. Замолкаем.
+            logger.warning("journal: giving up on updates", exc_info=True)
+            self._broken = True
+
+    async def finish(self) -> None:
+        """Оставить журнал в топике. Пустой (агент не сделал ни шага) — убрать."""
+        if self.msg is None or self.total_steps:
+            return
+        try:
+            await self.msg.delete()
+        except Exception:
+            pass
+
+
 def extract_file_markers(text: str) -> tuple[str, list[tuple[str, str | None]]]:
     """Парсит маркеры [[FILE: /path]] / [[FILE: /path | caption]] на отдельных строках.
     Возвращает (текст без маркеров, список (path, caption|None))."""
@@ -1645,7 +2003,7 @@ async def call_llm_stream(
     # системный канал движка вместо вшивания в каждый prompt.
     mcp_playwright = get_mcp_playwright(*key)
     effective_cwd = cwd or CLAUDE_CWD
-    system_prefix = build_system_prefix(effective_cwd, mcp_playwright)
+    system_prefix = build_system_prefix(effective_cwd, mcp_playwright, key=key)
 
     ok, final_text, sid_after, actual_model = await engine.call_stream(
         session_id=session_id,
@@ -1742,10 +2100,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/engine [name] — показать/переключить движок (claude|codex|opencode)\n"
         "/browser [on|off] — браузер (Playwright MCP) для топика, on-demand\n"
         "/tokens — оценка размера текущей сессии\n"
-        "/compact — вручную сделать summary и начать новую сессию\n"
-        "/autocompact [on|off|status] — авто-сжатие длинной сессии\n"
-        "/new, /reset — новая сессия (cwd сохраняется)\n"
-        "/stop — прервать текущий запрос (сессия сохраняется)\n"
+        f"/close — закрыть сеанс (сам закроется после {SESSION_IDLE_MINUTES} мин простоя)\n"
+        "/new, /reset — закрыть сеанс и сразу открыть новый\n"
+        "/stop — прервать текущий запрос (сеанс сохраняется)\n"
         "/session — показать session-id, cwd и движок\n"
         "/bind <path> — привязать топик к директории\n"
         "/unbind — сбросить привязку к дефолту\n"
@@ -1762,11 +2119,12 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await terminate_process_tree(proc)
         logger.info("reset: killed active proc for key=%s", key)
     new_id, cwd, engine_name = reset_session(*key)
+    touch_session(*key)  # сеанс сразу открыт — /new это «закрыть и открыть»
     effective = cwd or CLAUDE_CWD
     logger.info("reset: key=%s engine=%s new_session=%s cwd=%s",
                 key, engine_name, new_id, effective)
     await update.message.reply_text(
-        f"Сессия сброшена ({engine_name}), новый id: {new_id}\nCwd: {effective}"
+        f"🆕 Новый сеанс ({engine_name}), id: {new_id}\nCwd: {effective}"
     )
 
 
@@ -1830,14 +2188,13 @@ def _topic_status_block(key: tuple[int, int]) -> str:
     else:
         model_line = "(дефолт движка; ещё ни разу не отвечал)"
     browser_state = "on" if get_mcp_playwright(*key) else "off"
-    compact_state = "on" if get_autocompact_enabled(*key) else "off"
     body = (
         f"engine     : {engine_name}\n"
         f"model      : {model_line}\n"
         f"session-id : {session_id}\n"
         f"cwd        : {effective_cwd}{cwd_suffix}\n"
         f"browser    : {browser_state}  (Playwright MCP, on-demand)\n"
-        f"compact    : {compact_state}  (max={AUTOCOMPACT_MAX_TOKENS})"
+        f"сеанс      : {_session_state_line(key)}"
     )
     return "<pre>" + _html_escape(body) + "</pre>"
 
@@ -1853,13 +2210,10 @@ async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     key = _key(update)
     session_id, cwd, engine_name = get_session(*key)
     usage = inspect_session_usage(engine_name, session_id, cwd or CLAUDE_CWD)
-    status = "on" if get_autocompact_enabled(*key) else "off"
     body = (
         f"engine      : {engine_name}\n"
         f"session-id  : {session_id}\n"
-        f"autocompact: {status}\n"
-        f"warn        : {AUTOCOMPACT_WARN_TOKENS}\n"
-        f"max         : {AUTOCOMPACT_MAX_TOKENS}\n"
+        f"сеанс       : {_session_state_line(key)}\n"
         f"usage       : {_usage_line(usage)}"
     )
     if usage.path:
@@ -1867,66 +2221,30 @@ async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("<pre>" + _html_escape(body) + "</pre>", parse_mode=ParseMode.HTML)
 
 
-async def cmd_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Закрыть сеанс — как закрыть окно терминала. Топик (cwd, движок, модель)
+    остаётся, контекст сессии — нет. Следующее сообщение откроет новый сеанс."""
     key = _key(update)
-    if active_procs.get(key) is not None:
-        await update.message.reply_text("Сейчас в топике идёт запрос. Сначала /stop или дождись ответа.")
-        return
-    msg = await update.message.reply_text("Сжимаю контекст текущей сессии...")
-    lock = _lock_for(key)
-    await lock.acquire()
-    ok = False
-    result = "внутренняя ошибка"
-    try:
-        _session_id, cwd, engine_name = get_session(*key)
-        model = get_model(*key)
 
-        async def notify(text: str) -> None:
-            try:
-                await msg.edit_text(text[-TG_HARD_LIMIT:])
-            except Exception:
-                pass
+    proc = active_procs.get(key)
+    if proc is not None:
+        await terminate_process_tree(proc)
+        active_procs.pop(key, None)
+        logger.info("session close: killed active proc for key=%s", key)
 
-        ok, result = await _compact_current_session(
-            key, "manual /compact", engine_name, cwd, model, notify,
-        )
-    except Exception as exc:
-        logger.exception("manual compact failed key=%s", key)
-        result = str(exc)
-    finally:
-        try:
-            lock.release()
-        except RuntimeError:
-            pass
-    await msg.edit_text(("Готово: " if ok else "Не получилось: ") + result)
-
-
-async def cmd_autocompact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    key = _key(update)
-    args = [a.strip().lower() for a in (context.args or [])]
-    if not args or args[0] in {"status", "статус"}:
-        inherited = "on" if AUTOCOMPACT_DEFAULT else "off"
-        current = "on" if get_autocompact_enabled(*key) else "off"
+    was_open = close_session(*key)
+    if not was_open:
         await update.message.reply_text(
-            "Autocompact: "
-            f"{current} (env default: {inherited}, warn={AUTOCOMPACT_WARN_TOKENS}, "
-            f"max={AUTOCOMPACT_MAX_TOKENS}).\n"
-            "Команды: /autocompact on | off | inherit"
+            "Сеанс и так закрыт. Следующее сообщение откроет новый."
         )
         return
-    arg = args[0]
-    if arg in {"on", "вкл", "1", "true", "yes"}:
-        set_autocompact_enabled(key[0], key[1], True)
-        await update.message.reply_text("Autocompact включён для этого топика.")
-    elif arg in {"off", "выкл", "0", "false", "no"}:
-        set_autocompact_enabled(key[0], key[1], False)
-        await update.message.reply_text("Autocompact выключен для этого топика.")
-    elif arg in {"inherit", "default", "env", "auto"}:
-        set_autocompact_enabled(key[0], key[1], None)
-        inherited = "on" if AUTOCOMPACT_DEFAULT else "off"
-        await update.message.reply_text(f"Autocompact снова наследует env default: {inherited}.")
-    else:
-        await update.message.reply_text("Используй: /autocompact on | off | inherit | status")
+
+    _sid, cwd, engine_name = get_session(*key)
+    logger.info("session closed: key=%s engine=%s", key, engine_name)
+    await update.message.reply_text(
+        "🚪 Сеанс закрыт. Контекст сброшен — следующее сообщение начнёт новый.\n"
+        f"Топик сохранён: {engine_name}, {cwd or CLAUDE_CWD}"
+    )
 
 
 def _browser_keyboard(enabled: bool) -> InlineKeyboardMarkup:
@@ -2146,48 +2464,6 @@ async def _do_engine_switch(
     )
 
 
-async def _generate_handoff_summary(
-    key: tuple[int, int], old_engine_name: str, cwd: str | None, old_model: str | None,
-) -> str | None:
-    """Попросить старый движок сгенерировать summary диалога.
-    Возвращает очищенный текст (до 4000 символов) или None при ошибке."""
-    old_engine = get_engine_by_name(old_engine_name)
-    old_session_id, _, _ = get_session(*key)
-    effective_cwd = cwd or CLAUDE_CWD
-
-    # Системный блок добавит call_llm_stream через системный канал движка —
-    # здесь только сама инструкция на summary.
-    summary_prompt = (
-        "Сделай краткое резюме нашего диалога для передачи другому LLM-агенту, "
-        "который продолжит разговор вместо тебя. Включи: 1) цель/задачу, "
-        "2) текущий статус и ключевые решения, 3) что уже выяснено или сделано, "
-        "4) открытые вопросы и следующий шаг. До 2000 символов. Без преамбул "
-        "и заключений — только сам summary, чтобы агент сразу понял контекст."
-    )
-
-    async def on_intermediate(_text: str) -> None:
-        pass
-
-    try:
-        with engine_model_scope(old_engine.name, old_model):
-            ok, summary_text, _sid_after = await call_llm_stream(
-                old_engine, old_session_id, summary_prompt, key, cwd, on_intermediate,
-            )
-    except Exception as exc:
-        logger.exception("handoff summary call crashed: key=%s engine=%s",
-                         key, old_engine_name)
-        return None
-
-    if not ok or not summary_text.strip():
-        logger.warning("handoff summary empty: key=%s engine=%s", key, old_engine_name)
-        return None
-
-    cleaned, _ = extract_file_markers(summary_text)
-    cleaned = cleaned.strip() or summary_text.strip()
-    cleaned = cleaned[:AUTOCOMPACT_SUMMARY_CHARS]
-    return cleaned
-
-
 def _usage_line(usage: SessionUsage) -> str:
     token_value = usage.threshold_tokens
     token_part = "unknown" if token_value is None else f"{token_value:,}".replace(",", " ")
@@ -2211,65 +2487,6 @@ def _inspect_topic_usage(key: tuple[int, int]) -> SessionUsage:
     return inspect_session_usage(engine_name, session_id, cwd or CLAUDE_CWD)
 
 
-def _autocompact_reason(usage: SessionUsage) -> str | None:
-    tokens = usage.threshold_tokens
-    if tokens is None:
-        return None
-    if tokens >= AUTOCOMPACT_MAX_TOKENS:
-        label = "estimated " if usage.is_estimate else ""
-        return (
-            f"{label}context {tokens} tokens >= "
-            f"JARVIS_AUTOCOMPACT_MAX_TOKENS={AUTOCOMPACT_MAX_TOKENS}"
-        )
-    return None
-
-
-async def _compact_current_session(
-    key: tuple[int, int],
-    reason: str,
-    old_engine_name: str,
-    cwd: str | None,
-    old_model: str | None,
-    notify=None,
-) -> tuple[bool, str]:
-    """Summarize current session, reset session_id, store summary for next prompt."""
-    if notify is not None:
-        await notify(f"Сжимаю контекст: {reason}")
-    summary = await _generate_handoff_summary(key, old_engine_name, cwd, old_model)
-    if not summary:
-        return False, "не удалось получить summary старой сессии"
-
-    new_id, effective_cwd, engine_name = reset_session(*key)
-    set_pending_summary(key[0], key[1], summary)
-    logger.info(
-        "autocompact done: key=%s engine=%s new_session=%s summary_len=%d reason=%s",
-        key, engine_name, new_id, len(summary), reason,
-    )
-    return (
-        True,
-        f"контекст сжат; новая сессия {new_id}; cwd={effective_cwd or CLAUDE_CWD}",
-    )
-
-
-async def _maybe_autocompact(
-    key: tuple[int, int],
-    engine_name: str,
-    cwd: str | None,
-    model: str | None,
-    notify=None,
-) -> None:
-    if not get_autocompact_enabled(*key):
-        return
-    usage = _inspect_topic_usage(key)
-    reason = _autocompact_reason(usage)
-    if reason is None:
-        return
-    ok, msg = await _compact_current_session(key, reason, engine_name, cwd, model, notify)
-    if notify is not None:
-        prefix = "Autocompact готов:" if ok else "Autocompact не выполнен:"
-        await notify(f"{prefix} {msg}")
-
-
 async def _do_engine_handoff(
     key: tuple[int, int],
     old_engine_name: str,
@@ -2277,12 +2494,15 @@ async def _do_engine_handoff(
     progress_edit,
     model: str | None = None,
 ) -> str:
-    """Сценарий «с переносом»: 1) lock топика, 2) попросить старый движок
-    выдать summary, 3) сохранить в pending_summary, 4) переключить движок.
-    `progress_edit(text)` — async-функция для обновления карточки в чате."""
+    """Сценарий «с переносом контекста»: переключить движок и велеть новому
+    поднять историю топика самому (через manager_inbox).
+
+    Раньше здесь старый движок гонялся за резюме — полный проход по всей его
+    истории, самый дорогой вызов из возможных, да ещё и до переключения. Теперь
+    переключение мгновенное и бесплатное: новый движок читает ровно столько,
+    сколько ему нужно, и только когда ему нужно.
+    """
     chat_id, thread_id = key
-    old_model = get_model(*key)
-    _, cwd, _ = get_session(*key)
 
     lock = _lock_for(key)
     if lock.locked():
@@ -2293,29 +2513,17 @@ async def _do_engine_handoff(
 
     await lock.acquire()
     try:
-        await progress_edit(f"🧠 Снимаю резюме сессии у {old_engine_name}...")
-
-        cleaned = await _generate_handoff_summary(key, old_engine_name, cwd, old_model)
-        if cleaned is None:
-            return (
-                f"❌ {old_engine_name} не вернул резюме. Переключение отменено. "
-                "Можешь попробовать без переноса контекста."
-            )
-
         await progress_edit("🔁 Переключаю движок...")
         switch_text = await _do_engine_switch(key, new_engine_name, model=model)
-        set_pending_summary(chat_id, thread_id, cleaned)
-        logger.info("handoff: stored pending_summary for key=%s (%d chars)",
-                    key, len(cleaned))
-
-        preview = cleaned[:200].rstrip()
-        if len(cleaned) > 200:
-            preview += "..."
+        set_pending_summary(
+            chat_id, thread_id, _transfer_marker(old_engine_name),
+        )
+        logger.info("handoff: stored transfer marker for key=%s (old=%s)",
+                    key, old_engine_name)
         return (
             f"{switch_text}\n\n"
-            f"📝 Резюме от {old_engine_name} сохранено и будет передано в первое "
-            f"твоё сообщение новому движку.\n\n"
-            f"<i>preview:</i>\n<code>{_html_escape(preview)}</code>"
+            f"📖 Новый движок сам поднимет историю топика через manager_inbox "
+            f"при первом сообщении — резюме у {old_engine_name} не запрашиваем."
         )
     finally:
         try:
@@ -2775,6 +2983,20 @@ async def _process_prompt(
     tg_msg_id = update.message.message_id if update.message else None
     log_message(chat.id, thread_id, "in", "user_text", in_text, tg_msg_id)
 
+    # Агент ждёт ответа на ask_user? Тогда это сообщение — ОТВЕТ ему, а не новый
+    # запрос. Перехватываем ДО очереди и lock'а: агент держит lock, стоя в
+    # ask_user, и без перехвата ответ ушёл бы к нему вторым, отдельным ходом.
+    pending_ask = get_pending_ask(chat.id, thread_id)
+    if pending_ask is not None and user_text.strip():
+        if answer_ask(pending_ask["id"], user_text.strip(), via="text"):
+            logger.info("ask #%s answered by text: key=%s", pending_ask["id"], key)
+            await _mark_ask_answered(chat, pending_ask, user_text.strip())
+            return
+        # Не смогли записать — вопрос уже закрыт (кнопка/таймаут). Обрабатываем
+        # сообщение как обычный запрос.
+        logger.info("ask #%s already closed, treating as normal message",
+                    pending_ask["id"])
+
     # Reply-to контекст и вложения → meta_block
     extra_lines: list[str] = []
     reply = update.message.reply_to_message if update.message else None
@@ -2849,95 +3071,57 @@ async def _process_prompt(
 
     try:
         logger.info("lock acquired: key=%s", key)
-        # Получаем актуальные session/cwd/engine уже под локом (вдруг /reset
-        # или /engine сработал, пока мы стояли в очереди).
-        session_id, cwd, engine_name = get_session(*key)
+        # Сеанс под локом (вдруг /close, /reset или /engine сработали, пока мы
+        # стояли в очереди). Протухший или закрытый сеанс здесь же открывается
+        # заново — это аналог «открыть проект в терминале».
+        session_id, cwd, engine_name, opened_new = ensure_active_session(*key)
         engine = get_engine_by_name(engine_name)
         model = get_model(*key)
-        effective_cwd = cwd or CLAUDE_CWD
 
-        async def compact_notify(text: str) -> None:
+        if opened_new:
             try:
-                await send_to_topic(chat, thread_id, "♻️ " + text)
+                await send_to_topic(
+                    chat, thread_id,
+                    f"🆕 Новый сеанс ({engine_name}). Контекст прошлых разговоров "
+                    "не загружен — попроси поднять историю, если нужно.",
+                )
             except Exception:
-                logger.exception("failed to send autocompact notice key=%s", key)
+                logger.exception("failed to send new-session notice key=%s", key)
 
-        await _maybe_autocompact(key, engine_name, cwd, model, compact_notify)
-        session_id, cwd, engine_name = get_session(*key)
-        engine = get_engine_by_name(engine_name)
-        model = get_model(*key)
-        effective_cwd = cwd or CLAUDE_CWD
-
-        # Pending handoff summary: pop'аем атомарно — доставляется ровно один раз,
+        # Pending handoff: pop'аем атомарно — доставляется ровно один раз,
         # в первый prompt после переключения движка с переносом контекста.
-        pending_raw = pop_pending_summary(*key)
+        pending_raw = get_pending_summary(*key)
         pending_summary = None
         if pending_raw:
             pending_summary = await _resolve_pending_summary(key, pending_raw)
             if pending_summary:
-                logger.info("delivering pending_summary to engine=%s key=%s (%d chars)",
+                logger.info("delivering pending context to engine=%s key=%s (%d chars)",
                             engine_name, key, len(pending_summary))
 
         prompt_parts: list[str] = []  # [SYSTEM:]-блок уходит через системный канал движка
         if pending_summary:
-            prompt_parts.append(
-                "[Контекст от предыдущего движка — резюме прошлого диалога, "
-                "продолжай с этой точки:]\n" + pending_summary
-            )
+            prompt_parts.append("[Контекст:]\n" + pending_summary)
         if meta_block:
             prompt_parts.append(meta_block)
         prompt_parts.append("---\n\nСообщение пользователя:\n" + user_text)
         prompt = "\n\n".join(prompt_parts)
 
-        # Индикатор + промежуточные апдейты
-        indicator = None
-        try:
-            indicator = await update.message.reply_text("⏳ Думаю...")
-        except Exception:
-            indicator = None
-
-        async def on_intermediate(text: str) -> None:
-            nonlocal indicator
-            preview = text[-TG_HARD_LIMIT + 20:]
-            html_preview = md_to_html(preview)
-            if indicator is not None:
-                try:
-                    await indicator.edit_text(html_preview, parse_mode=ParseMode.HTML)
-                    return
-                except BadRequest as exc:
-                    if "parse" in str(exc).lower() or "entit" in str(exc).lower():
-                        try:
-                            await indicator.edit_text(preview)
-                            return
-                        except Exception:
-                            indicator = None
-                    else:
-                        indicator = None
-                except Exception:
-                    indicator = None
-            try:
-                indicator = await _send_with_html_fallback(
-                    chat.send_message, html_preview,
-                    **({"message_thread_id": thread_id} if thread_id else {}),
-                )
-            except Exception:
-                pass
+        # Журнал хода: шаги агента копятся в одном сообщении и остаются в топике.
+        journal = ProgressJournal(chat, thread_id)
+        await journal.start()
 
         try:
             with engine_model_scope(engine.name, model):
                 ok, final_text, _sid_after = await call_llm_stream(
-                    engine, session_id, prompt, key, cwd, on_intermediate,
+                    engine, session_id, prompt, key, cwd, journal.append,
                 )
+            if ok and pending_summary:
+                clear_pending_summary(*key)
         except Exception as exc:
             logger.exception("llm call crashed: key=%s engine=%s", key, engine.name)
             ok, final_text = False, f"Внутренняя ошибка: {exc}"
 
-        # Удалить индикатор (если можем) и отправить финал
-        if indicator is not None:
-            try:
-                await indicator.delete()
-            except Exception:
-                pass
+        await journal.finish()
 
         if not ok and not final_text.strip():
             logger.info("llm call stopped without final reply: key=%s engine=%s", key, engine.name)
@@ -2980,10 +3164,10 @@ async def _run_spawn(update: Update, user_text: str) -> None:
     prefix = f"[#{spawn_id}] "
 
     # cwd, engine, model наследуются из топика; session_id новый и в БД не сохраняется.
+    # Дефолт cwd подставит call_llm_stream — сюда передаём сырой cwd.
     _, cwd, engine_name = get_session(*key)
     engine = get_engine_by_name(engine_name)
     model = get_model(*key)
-    effective_cwd = cwd or CLAUDE_CWD
     session_id = engine.new_session_id()
 
     # [SYSTEM:]-блок уходит через системный канал движка (call_llm_stream).
@@ -2992,54 +3176,22 @@ async def _run_spawn(update: Update, user_text: str) -> None:
         + user_text
     )
 
-    try:
-        indicator = await send_to_topic(chat, thread_id, f"{prefix}⏳ Spawn запущен...")
-    except Exception:
-        indicator = None
-
-    async def on_intermediate(text: str) -> None:
-        nonlocal indicator
-        body = text[-(TG_HARD_LIMIT - len(prefix) - 20):]
-        html_msg = _html_escape(prefix) + md_to_html(body)
-        plain_msg = prefix + body
-        if indicator is not None:
-            try:
-                await indicator.edit_text(html_msg, parse_mode=ParseMode.HTML)
-                return
-            except BadRequest as exc:
-                if "parse" in str(exc).lower() or "entit" in str(exc).lower():
-                    try:
-                        await indicator.edit_text(plain_msg)
-                        return
-                    except Exception:
-                        indicator = None
-                else:
-                    indicator = None
-            except Exception:
-                indicator = None
-        try:
-            indicator = await _send_with_html_fallback(
-                chat.send_message, html_msg,
-                **({"message_thread_id": thread_id} if thread_id else {}),
-            )
-        except Exception:
-            pass
+    journal = ProgressJournal(
+        chat, thread_id, prefix=prefix, header="⏳ Spawn запущен...",
+    )
+    await journal.start()
 
     try:
         with engine_model_scope(engine.name, model):
             ok, final_text, _sid_after = await call_llm_stream(
-                engine, session_id, prompt, key, cwd, on_intermediate, spawn_id=spawn_id,
+                engine, session_id, prompt, key, cwd, journal.append, spawn_id=spawn_id,
             )
     except Exception as exc:
         logger.exception("spawn crashed: key=%s spawn=%s engine=%s",
                          key, spawn_id, engine.name)
         ok, final_text = False, f"Внутренняя ошибка: {exc}"
 
-    if indicator is not None:
-        try:
-            await indicator.delete()
-        except Exception:
-            pass
+    await journal.finish()
 
     if not ok and not final_text.strip():
         logger.info("spawn stopped without final reply: key=%s spawn=%s engine=%s",
@@ -3090,35 +3242,22 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
     await lock.acquire()
     try:
         logger.info("manager job %s: lock acquired key=%s", job_id, key)
-        session_id, cwd, engine_name = get_session(*key)
+        # Задача исполняется в сеансе топика; протухший сеанс здесь тоже
+        # переоткрывается. Job самодостаточен — полный текст задачи внутри.
+        session_id, cwd, engine_name, opened_new = ensure_active_session(*key)
         engine = get_engine_by_name(engine_name)
         model = get_model(*key)
         effective_cwd = cwd or CLAUDE_CWD
+        if opened_new:
+            logger.info("manager job %s: opened new session %s for key=%s",
+                        job_id, session_id, key)
 
-        async def compact_notify(text: str) -> None:
-            if is_self_kick:
-                logger.info("manager job %s autocompact: %s", job_id, text)
-                return
-            try:
-                await send_to_topic(chat, thread_id, "♻️ " + text)
-            except Exception:
-                logger.exception("manager job %s: autocompact notice failed", job_id)
-
-        await _maybe_autocompact(key, engine_name, cwd, model, compact_notify)
-        session_id, cwd, engine_name = get_session(*key)
-        engine = get_engine_by_name(engine_name)
-        model = get_model(*key)
-        effective_cwd = cwd or CLAUDE_CWD
-
-        pending_raw = pop_pending_summary(*key)
+        pending_raw = get_pending_summary(*key)
         pending_summary = await _resolve_pending_summary(key, pending_raw) if pending_raw else None
 
         prompt_parts: list[str] = []  # [SYSTEM:]-блок уходит через системный канал движка
         if pending_summary:
-            prompt_parts.append(
-                "[Контекст от предыдущего движка — резюме прошлого диалога, "
-                "продолжай с этой точки:]\n" + pending_summary
-            )
+            prompt_parts.append("[Контекст:]\n" + pending_summary)
         mgr_target = resolve_manager_topic()
         if is_self_kick:
             prompt_parts.append(
@@ -3183,43 +3322,18 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
         prompt_parts.append("---\n\nСообщение пользователя:\n" + user_text)
         prompt = "\n\n".join(prompt_parts)
 
-        if is_self_kick:
-            indicator = None
-        else:
-            try:
-                indicator = await send_to_topic(
-                    chat, thread_id,
-                    f"⏳ Manager делегировал задачу (job #{job_id})...",
-                )
-            except Exception:
-                indicator = None
+        # Self-kick — служебный ход Менеджера, топик им не засоряем: журнала нет.
+        journal: ProgressJournal | None = None
+        if not is_self_kick:
+            journal = ProgressJournal(
+                chat, thread_id,
+                header=f"⏳ Manager делегировал задачу (job #{job_id})...",
+            )
+            await journal.start()
 
         async def on_intermediate(text: str) -> None:
-            nonlocal indicator
-            preview = text[-TG_HARD_LIMIT + 20:]
-            html_preview = md_to_html(preview)
-            if indicator is not None:
-                try:
-                    await indicator.edit_text(html_preview, parse_mode=ParseMode.HTML)
-                    return
-                except BadRequest as exc:
-                    if "parse" in str(exc).lower() or "entit" in str(exc).lower():
-                        try:
-                            await indicator.edit_text(preview)
-                            return
-                        except Exception:
-                            indicator = None
-                    else:
-                        indicator = None
-                except Exception:
-                    indicator = None
-            try:
-                indicator = await _send_with_html_fallback(
-                    chat.send_message, html_preview,
-                    **({"message_thread_id": thread_id} if thread_id else {}),
-                )
-            except Exception:
-                pass
+            if journal is not None:
+                await journal.append(text)
 
         # Watcher для interrupt: раз в 2с смотрит cancel_requested.
         # Если выставлен — терминирует subprocess; основной stream выйдет
@@ -3268,6 +3382,8 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
                 ok, final_text, _sid_after = await call_llm_stream(
                     engine, session_id, prompt, key, cwd, on_intermediate,
                 )
+            if ok and pending_summary:
+                clear_pending_summary(*key)
         except Exception as exc:
             logger.exception("manager job %s: llm crashed engine=%s", job_id, engine.name)
             ok, final_text = False, f"Внутренняя ошибка: {exc}"
@@ -3278,11 +3394,8 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 watcher_task.cancel()
 
-        if indicator is not None:
-            try:
-                await indicator.delete()
-            except Exception:
-                pass
+        if journal is not None:
+            await journal.finish()
 
         if interrupted:
             # Менеджер прервал. Доделаем то немногое что успели увидеть в
@@ -3650,11 +3763,10 @@ async def unauthorized_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 # Описания короткие — Telegram обрезает длинные.
 BOT_COMMANDS: list[BotCommand] = [
     BotCommand("engine", "движок: показать/переключить (claude|codex|opencode)"),
-    BotCommand("new", "новая сессия (cwd и движок сохраняются)"),
-    BotCommand("session", "session-id, cwd и движок"),
+    BotCommand("close", "закрыть сеанс (контекст сбрасывается)"),
+    BotCommand("new", "закрыть сеанс и сразу открыть новый"),
+    BotCommand("session", "session-id, cwd, движок и состояние сеанса"),
     BotCommand("tokens", "оценка размера текущей сессии"),
-    BotCommand("compact", "сжать контекст: summary + новая сессия"),
-    BotCommand("autocompact", "авто-сжатие длинной сессии"),
     BotCommand("stop", "прервать текущий запрос"),
     BotCommand("spawn", "одноразовая параллельная сессия — /spawn <prompt>"),
     BotCommand("bind", "привязать топик к каталогу — /bind <abs path>"),
@@ -3757,8 +3869,7 @@ def main() -> None:
     app.add_handler(CommandHandler("spawn", cmd_spawn, filters=allowed))
     app.add_handler(CommandHandler("session", cmd_session, filters=allowed))
     app.add_handler(CommandHandler("tokens", cmd_tokens, filters=allowed))
-    app.add_handler(CommandHandler("compact", cmd_compact, filters=allowed))
-    app.add_handler(CommandHandler("autocompact", cmd_autocompact, filters=allowed))
+    app.add_handler(CommandHandler("close", cmd_close, filters=allowed))
     app.add_handler(CommandHandler("engine", cmd_engine, filters=allowed))
     app.add_handler(CommandHandler("browser", cmd_browser, filters=allowed))
     app.add_handler(CommandHandler("bind", cmd_bind, filters=allowed))
@@ -3772,6 +3883,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_engine_select, pattern=r"^engine_select:"))
     app.add_handler(CallbackQueryHandler(on_model_select, pattern=r"^model_select:"))
     app.add_handler(CallbackQueryHandler(on_engine_carry, pattern=r"^engine_carry:"))
+    app.add_handler(CallbackQueryHandler(on_ask_answer, pattern=r"^ask:"))
     app.add_handler(CallbackQueryHandler(on_browser_toggle, pattern=r"^browser_toggle:"))
 
     app.add_handler(MessageHandler(~allowed, unauthorized_handler))
