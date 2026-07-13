@@ -77,6 +77,212 @@ def _playwright_mcp_flags(mcp_playwright: bool) -> list[str]:
     return ["--mcp-config", json.dumps(config, ensure_ascii=False)]
 
 
+def _accumulate_assistant_event(ev: dict, buffer_intermediate: list[str]) -> None:
+    """Извлечь шаги журнала (текст/размышления/tool_use) из assistant-события
+    stream-json. Общая логика для одноразового ``call_stream`` и живого
+    ``PersistentClaudeWorker`` — событие одно и то же в обоих режимах."""
+    msg = ev.get("message", {}) or {}
+    for block in msg.get("content", []) or []:
+        btype = block.get("type")
+        if btype == "text":
+            txt = (block.get("text") or "").strip()
+            if txt:
+                buffer_intermediate.append(txt[:800])
+        elif btype == "thinking":
+            # См. call_stream: Claude Code не отдаёт текст рассуждений наружу.
+            buffer_intermediate.append("💭 размышляет…")
+        elif btype == "tool_use":
+            name = block.get("name", "?")
+            inp = block.get("input") or {}
+            summary = ""
+            if isinstance(inp, dict):
+                for k in ("command", "file_path", "path",
+                          "pattern", "url", "description"):
+                    if k in inp and inp[k]:
+                        s = str(inp[k])
+                        summary = f" {k}={s[:120]}"
+                        break
+            buffer_intermediate.append(f"🔧 {name}{summary}")
+
+
+class PersistentClaudeWorker:
+    """Живой ``claude`` subprocess в ``stream-json``/``stream-json`` режиме,
+    держится на весь сеанс топика вместо процесса на сообщение.
+
+    Сообщение, отправленное пока идёт предыдущий ход (между стартом хода и
+    его ``result``), не порождает новый subprocess и не ждёт лока — пишется в
+    тот же stdin и подхватывается моделью сразу после текущего шага (tool-вызов
+    при этом НЕ прерывается, только между шагами). Экспериментально проверено
+    2026-07-13 — см. knowledge-base/projects/jarvis/README.md.
+    """
+
+    def __init__(self, key: tuple[int, int], proc: asyncio.subprocess.Process,
+                 session_id: str, cwd: str):
+        self.key = key
+        self.proc = proc
+        self.session_id = session_id
+        self.cwd = cwd
+        self.busy = False
+        self.dead = False
+        self.last_activity = time.monotonic()
+        self.turn_lock = asyncio.Lock()
+        self.pending_future: asyncio.Future | None = None
+        self.on_intermediate: Callable[[str], Awaitable[None]] | None = None
+        self.reader_task: asyncio.Task | None = None
+        self._buffer: list[str] = []
+        self._last_push = 0.0
+
+    def _write_user_message(self, text: str) -> None:
+        line = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        }) + "\n"
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(line.encode())
+
+    async def submit(self, text: str) -> tuple[bool, "asyncio.Future"]:
+        """Отправить реплику живому процессу.
+
+        Возвращает (is_new_turn, future). ``future`` резолвится в
+        ``(ok, final_text)`` — ждать её нужно, только если ``is_new_turn``:
+        если ход уже шёл, реплика просто дописана в него, и результат придёт
+        тому вызову, который этот ход начал."""
+        async with self.turn_lock:
+            is_new = not self.busy
+            if is_new:
+                self.busy = True
+                self.pending_future = asyncio.get_running_loop().create_future()
+            fut = self.pending_future
+            self._write_user_message(text)
+            try:
+                assert self.proc.stdin is not None
+                await self.proc.stdin.drain()
+            except Exception:
+                logger.exception("persistent worker: stdin.drain failed key=%s", self.key)
+        self.last_activity = time.monotonic()
+        return is_new, fut
+
+    async def _flush(self, force: bool = False) -> None:
+        if not self._buffer:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_push) < INTERMEDIATE_MIN_INTERVAL:
+            return
+        text = "\n".join(self._buffer)
+        self._buffer.clear()
+        self._last_push = now
+        cb = self.on_intermediate
+        if cb is None:
+            return
+        try:
+            await cb(text)
+        except Exception:
+            logger.exception("persistent worker: on_intermediate failed key=%s", self.key)
+
+    def _resolve(self, ok: bool, text: str) -> None:
+        fut = self.pending_future
+        self.pending_future = None
+        self.busy = False
+        self.last_activity = time.monotonic()
+        if fut is not None and not fut.done():
+            fut.set_result((ok, text))
+
+    async def _read_loop(self) -> None:
+        assert self.proc.stdout is not None
+        try:
+            while True:
+                line = await self.proc.stdout.readline()
+                if not line:
+                    break
+                raw = line.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    ev = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                etype = ev.get("type")
+                if etype == "assistant":
+                    _accumulate_assistant_event(ev, self._buffer)
+                    await self._flush()
+                elif etype == "result":
+                    await self._flush(force=True)
+                    r = ev.get("result")
+                    self._resolve(True, r if isinstance(r, str) else "")
+        except Exception:
+            logger.exception("persistent worker: read loop crashed key=%s", self.key)
+        finally:
+            self.dead = True
+            await self._flush(force=True)
+            # Процесс умер (краш/убили) во время хода — будим ожидающего, а не
+            # вешаем его до CLAUDE_TIMEOUT.
+            if self.pending_future is not None and not self.pending_future.done():
+                self._resolve(False, "")
+
+    async def read_stderr_tail(self) -> str:
+        if self.proc.stderr is None:
+            return ""
+        try:
+            data = await self.proc.stderr.read(4096)
+            return data.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+
+async def start_persistent(
+    key: tuple[int, int],
+    session_id: str,
+    cwd: str,
+    model: str | None,
+    system_prefix: str | None,
+    mcp_playwright: bool,
+) -> PersistentClaudeWorker:
+    """Поднять живой ``claude`` под ``stream-json`` вход/выход. Флаги сессии —
+    как в разовом вызове (``--resume``/``--session-id``), но выставляются
+    ОДИН раз при старте процесса: все следующие реплики уходят в его stdin,
+    без пересоздания."""
+    resume_mode = ClaudeEngine().session_exists(session_id, cwd)
+    if resume_mode:
+        ClaudeEngine().clear_stale_session_pidfile(session_id)
+        session_flags = ["--resume", session_id]
+    else:
+        session_flags = ["--session-id", session_id]
+
+    model_flags = ["--model", model] if model else []
+    append_system = APPEND_SYSTEM_PROMPT
+    if system_prefix:
+        append_system = f"{system_prefix}\n\n{APPEND_SYSTEM_PROMPT}"
+    mcp_flags = _playwright_mcp_flags(mcp_playwright)
+
+    cmd = [
+        CLAUDE_BIN, "--print",
+        "--permission-mode", "bypassPermissions",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--append-system-prompt", append_system,
+        *mcp_flags,
+        *model_flags,
+        *session_flags,
+    ]
+    logger.info(
+        "persistent claude start: key=%s session=%s mode=%s cwd=%s",
+        key, session_id, "resume" if resume_mode else "new", cwd,
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        start_new_session=True,
+        limit=10 * 1024 * 1024,
+    )
+    worker = PersistentClaudeWorker(key, proc, session_id, cwd)
+    worker.reader_task = asyncio.create_task(worker._read_loop())
+    return worker
+
+
 class ClaudeEngine:
     name = "claude"
     bin_path = CLAUDE_BIN
@@ -268,31 +474,7 @@ class ClaudeEngine:
                         m = msg.get("model")
                         if isinstance(m, str) and m:
                             actual_model = m
-                    for block in msg.get("content", []) or []:
-                        btype = block.get("type")
-                        if btype == "text":
-                            txt = (block.get("text") or "").strip()
-                            if txt:
-                                buffer_intermediate.append(txt[:800])
-                        elif btype == "thinking":
-                            # Claude Code НЕ отдаёт текст рассуждений наружу: поле
-                            # `thinking` всегда пустое, приходит только signature
-                            # (проверено на 2.1.207, в т.ч. с
-                            # --include-partial-messages и --effort high). Показать
-                            # можем лишь сам факт — что ход включал размышление.
-                            buffer_intermediate.append("💭 размышляет…")
-                        elif btype == "tool_use":
-                            name = block.get("name", "?")
-                            inp = block.get("input") or {}
-                            summary = ""
-                            if isinstance(inp, dict):
-                                for k in ("command", "file_path", "path",
-                                          "pattern", "url", "description"):
-                                    if k in inp and inp[k]:
-                                        s = str(inp[k])
-                                        summary = f" {k}={s[:120]}"
-                                        break
-                            buffer_intermediate.append(f"🔧 {name}{summary}")
+                    _accumulate_assistant_event(ev, buffer_intermediate)
                     await flush_intermediate()
                 elif etype == "result":
                     r = ev.get("result")

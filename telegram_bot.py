@@ -22,6 +22,7 @@ import sqlite3
 import asyncio
 import logging
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 
 from telegram import (
@@ -57,6 +58,11 @@ from engines import (
 )
 from engines.process_control import terminate_process_tree
 from engines.session_usage import SessionUsage, inspect_session_usage
+from engines.claude_engine import (
+    CLAUDE_TIMEOUT,
+    PersistentClaudeWorker,
+    start_persistent as start_persistent_claude,
+)
 
 # ---------- Константы ----------
 
@@ -292,6 +298,19 @@ def init_db() -> None:
                 logger.info("adding 'mcp_playwright' column to sessions (default=0)")
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN mcp_playwright INTEGER NOT NULL DEFAULT 0"
+                )
+            # Idempotent миграция: persistent_claude — per-topic флаг «живой
+            # процесс claude». 0 = off (дефолт): сообщение на сообщение —
+            # отдельный subprocess. 1 = on: один subprocess на сеанс
+            # (--input-format stream-json), сообщение во время активного хода
+            # дописывается в его stdin вместо ожидания очереди. Команда
+            # /persistent тоглит флаг.
+            cols_now = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+            if cols_now and "persistent_claude" not in cols_now:
+                _backup_db_once()
+                logger.info("adding 'persistent_claude' column to sessions (default=0)")
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN persistent_claude INTEGER NOT NULL DEFAULT 0"
                 )
             # Idempotent миграция: autocompact_enabled — легаси, автокомпакт
             # убран вместе с переходом на сеансы. Колонку не используем и не
@@ -1369,6 +1388,41 @@ def set_mcp_playwright(chat_id: int, thread_id: int, enabled: bool) -> None:
             )
 
 
+def get_persistent_claude(chat_id: int, thread_id: int) -> bool:
+    """True, если для топика включён живой процесс claude (/persistent on)."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT persistent_claude FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, thread_id),
+        ).fetchone()
+    return bool(row[0]) if row and row[0] is not None else False
+
+
+def set_persistent_claude(chat_id: int, thread_id: int, enabled: bool) -> None:
+    """Выставляет per-topic флаг живого процесса claude."""
+    now = datetime.utcnow().isoformat()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT cwd, engine FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, thread_id),
+        ).fetchone()
+        if row is None:
+            engine_name = DEFAULT_ENGINE_NAME
+            new_id = get_engine_by_name(engine_name).new_session_id()
+            conn.execute(
+                "INSERT INTO sessions(chat_id, thread_id, session_id, cwd, engine, "
+                "persistent_claude, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, thread_id, new_id, None, engine_name,
+                 1 if enabled else 0, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE sessions SET persistent_claude = ?, updated_at = ? "
+                "WHERE chat_id = ? AND thread_id = ?",
+                (1 if enabled else 0, now, chat_id, thread_id),
+            )
+
+
 def update_actual_model(
     chat_id: int, thread_id: int, engine_name: str, model: str | None,
 ) -> None:
@@ -1674,6 +1728,59 @@ active_procs: dict[tuple[int, int], asyncio.subprocess.Process] = {}
 # Отдельный реестр для /spawn: key=(chat_id, thread_id, spawn_id_hex).
 # Основной /stop не трогает эти процессы; снять spawn можно через /stop <spawn_id>.
 spawn_procs: dict[tuple[int, int, str], asyncio.subprocess.Process] = {}
+
+# Живые процессы claude для топиков с /persistent on. Отдельно от active_procs:
+# эти сообщения НЕ идут через chat_locks — сообщение, пришедшее пока живой
+# процесс занят ходом, дописывается в его stdin, а не ждёт очереди.
+persistent_workers: dict[tuple[int, int], PersistentClaudeWorker] = {}
+
+# Простаивающий живой процесс не экономит токены (сессия и так резюмируется
+# с диска) — только задержку на старте. Держать его вечно смысла нет.
+PERSISTENT_IDLE_MINUTES = _int_env_raw("JARVIS_PERSISTENT_IDLE_MINUTES", 20)
+
+
+async def _kill_persistent_worker(key: tuple[int, int], reason: str) -> bool:
+    """Убить живой процесс claude топика, если есть. Будит того, кто ждёт
+    результата текущего хода (не вешает его до CLAUDE_TIMEOUT). Возвращает
+    True, если воркер был и его убили."""
+    worker = persistent_workers.pop(key, None)
+    if worker is None:
+        return False
+    logger.info("killing persistent worker key=%s reason=%s", key, reason)
+    worker.dead = True
+    if worker.pending_future is not None and not worker.pending_future.done():
+        worker.pending_future.set_result((False, reason))
+    if worker.reader_task is not None:
+        worker.reader_task.cancel()
+    await terminate_process_tree(worker.proc)
+    return True
+
+
+async def persistent_reaper(app: Application) -> None:
+    """Убивает простаивающие живые процессы claude (свободные между ходами)
+    после PERSISTENT_IDLE_MINUTES простоя. Живой процесс не экономит токены
+    (сессия и так резюмируется с диска), только задержку на старте — вечно
+    держать subprocess смысла нет. Активные (busy) воркеры не трогает."""
+    if PERSISTENT_IDLE_MINUTES <= 0:
+        logger.info("persistent_reaper: disabled (JARVIS_PERSISTENT_IDLE_MINUTES<=0)")
+        return
+    logger.info("persistent_reaper started (idle=%dmin)", PERSISTENT_IDLE_MINUTES)
+    while True:
+        try:
+            await asyncio.sleep(60.0)
+            now = time.monotonic()
+            stale = [
+                key for key, w in list(persistent_workers.items())
+                if not w.busy and (now - w.last_activity) > PERSISTENT_IDLE_MINUTES * 60
+            ]
+            for key in stale:
+                await _kill_persistent_worker(key, "")
+                logger.info("persistent_reaper: killed idle worker key=%s", key)
+        except asyncio.CancelledError:
+            logger.info("persistent_reaper cancelled")
+            raise
+        except Exception:
+            logger.exception("persistent_reaper loop crashed; continuing")
 
 
 def _lock_for(key: tuple[int, int]) -> asyncio.Lock:
@@ -2203,6 +2310,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды:\n"
         "/engine [name] — показать/переключить движок (claude|codex|opencode)\n"
         "/browser [on|off] — браузер (Playwright MCP) для топика, on-demand\n"
+        "/persistent [on|off] — живой процесс claude: сообщения на лету, без очереди\n"
         "/tokens — оценка размера текущей сессии\n"
         f"/close — закрыть сеанс (сам закроется после {SESSION_IDLE_MINUTES} мин простоя)\n"
         "/new, /reset — закрыть сеанс и сразу открыть новый\n"
@@ -2222,6 +2330,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if proc is not None:
         await terminate_process_tree(proc)
         logger.info("reset: killed active proc for key=%s", key)
+    await _kill_persistent_worker(key, "сеанс сброшен через /new или /reset")
     new_id, cwd, engine_name = reset_session(*key)
     touch_session(*key)  # сеанс сразу открыт — /new это «закрыть и открыть»
     effective = cwd or CLAUDE_CWD
@@ -2246,6 +2355,15 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await terminate_process_tree(sproc)
         spawn_procs.pop(skey, None)
         await update.message.reply_text(f"⛔ Spawn [#{spawn_id}] прерван.")
+        return
+
+    worker = persistent_workers.get(key)
+    if worker is not None and worker.busy and not worker.dead:
+        await _kill_persistent_worker(key, "прервано через /stop")
+        await update.message.reply_text(
+            "⛔ Живой процесс claude прерван. Сессия сохранена — следующее "
+            "сообщение поднимет новый живой процесс."
+        )
         return
 
     proc = active_procs.get(key)
@@ -2292,12 +2410,14 @@ def _topic_status_block(key: tuple[int, int]) -> str:
     else:
         model_line = "(дефолт движка; ещё ни разу не отвечал)"
     browser_state = "on" if get_mcp_playwright(*key) else "off"
+    persistent_state = "on" if get_persistent_claude(*key) else "off"
     body = (
         f"engine     : {engine_name}\n"
         f"model      : {model_line}\n"
         f"session-id : {session_id}\n"
         f"cwd        : {effective_cwd}{cwd_suffix}\n"
         f"browser    : {browser_state}  (Playwright MCP, on-demand)\n"
+        f"persistent : {persistent_state}  (живой процесс claude)\n"
         f"сеанс      : {_session_state_line(key)}"
     )
     return "<pre>" + _html_escape(body) + "</pre>"
@@ -2445,6 +2565,95 @@ async def on_browser_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         await query.edit_message_text(
             text, reply_markup=_browser_keyboard(get_mcp_playwright(*key)),
+        )
+    except BadRequest:
+        await send_to_topic(update.effective_chat, key[1], text)
+
+
+def _persistent_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    target = "off" if enabled else "on"
+    label = "🚫 Выключить живой процесс" if enabled else "⚡ Включить живой процесс"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=f"persistent_toggle:{target}")]]
+    )
+
+
+async def _apply_persistent(key: tuple[int, int], enable: bool) -> str:
+    session_id, _cwd, engine_name = get_session(*key)
+    if enable and engine_name != "claude":
+        return (
+            f"⚠️ Живой процесс сейчас есть только для claude, а у топика "
+            f"движок `{engine_name}`. Переключи `/engine claude` или включай "
+            "после."
+        )
+    set_persistent_claude(key[0], key[1], enable)
+    logger.info("persistent toggled for key=%s: %s", key, "on" if enable else "off")
+    if enable:
+        return (
+            "⚡ Живой процесс claude включён для топика. Со следующего "
+            "сообщения claude поднимается один раз на весь сеанс: то, что "
+            "прилетит, пока он ещё работает над предыдущим, допишется ему "
+            "прямо во время работы, а не будет ждать своей очереди. "
+            "Уже начатую команду это не остановит — только подхватится, как "
+            "только он освободится от неё. Выключай через /persistent off, "
+            "когда не нужно — простаивающий процесс просто занимает память."
+        )
+    await _kill_persistent_worker(key, "выключено через /persistent off")
+    return "🚫 Живой процесс выключен. Дальше — как обычно, процесс на сообщение."
+
+
+async def cmd_persistent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/persistent — статус + кнопка; /persistent on|off — включить/выключить
+    живой процесс claude для топика (сообщения во время работы агента
+    подхватываются на лету, а не ждут своей очереди)."""
+    key = _key(update)
+    args = [a.strip().lower() for a in (context.args or [])]
+    current = get_persistent_claude(*key)
+
+    if not args:
+        state = "включён" if current else "выключен"
+        await update.message.reply_text(
+            f"Живой процесс claude сейчас {state} для этого топика.\n\n"
+            "Пока выключен (дефолт) — на каждое сообщение новый процесс, а "
+            "то, что прилетает во время работы, ждёт своей очереди. Включи, "
+            "если хочешь на лету дописывать задачу агенту, пока он работает.",
+            reply_markup=_persistent_keyboard(current),
+        )
+        return
+
+    arg = args[0]
+    if arg in {"on", "вкл", "1", "true", "yes"}:
+        enable = True
+    elif arg in {"off", "выкл", "0", "false", "no"}:
+        enable = False
+    else:
+        await update.message.reply_text("Использование: /persistent [on|off]")
+        return
+
+    if enable == current:
+        await update.message.reply_text(
+            f"Живой процесс уже {'включён' if current else 'выключен'}."
+        )
+        return
+    await update.message.reply_text(await _apply_persistent(key, enable))
+
+
+async def on_persistent_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Колбэк кнопки persistent_toggle:<on|off>."""
+    query = update.callback_query
+    data = query.data or ""
+    if not data.startswith("persistent_toggle:"):
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    enable = data.split(":", 1)[1] == "on"
+    key = _key(update)
+    text = await _apply_persistent(key, enable)
+    try:
+        await query.edit_message_text(
+            text, reply_markup=_persistent_keyboard(get_persistent_claude(*key)),
         )
     except BadRequest:
         await send_to_topic(update.effective_chat, key[1], text)
@@ -3070,6 +3279,137 @@ async def cmd_where(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- Handlers: обработка сообщений ----------
 
+async def _finish_turn_reply(
+    chat, thread_id: int, journal: "ProgressJournal", ok: bool, final_text: str,
+    engine_name: str, key: tuple[int, int],
+) -> None:
+    """Общий хвост хода: закрыть журнал, отправить финальный ответ и файлы.
+    Общий для разового вызова движка и живого процесса claude (/persistent)."""
+    await journal.finish(final_text)
+
+    if not ok and not final_text.strip():
+        logger.info("llm call stopped without final reply: key=%s engine=%s", key, engine_name)
+        final_text = (
+            f"{engine_name} не прислал финальный ответ "
+            "(процесс завершился без текста). "
+            "Попробуй /new для новой сессии или переключи движок через /engine."
+        )
+
+    cleaned_text, file_markers = extract_file_markers(final_text)
+    if not cleaned_text.strip():
+        cleaned_text = "(пустой ответ)" if not file_markers else "(см. вложения)"
+    meta = {"type": "claude_response", "engine": engine_name}
+    try:
+        await send_claude_reply(chat, thread_id, cleaned_text, meta)
+    except Exception:
+        logger.exception("failed to send llm reply: key=%s", key)
+    if file_markers:
+        await deliver_file_markers(chat, thread_id, file_markers)
+
+
+async def _handle_persistent_message(
+    chat, thread_id: int, key: tuple[int, int], user_text: str, meta_block: str,
+) -> None:
+    """Путь для топиков с /persistent on: без topic-lock и без «в очереди».
+
+    Сообщение уходит живому процессу claude — новым ходом, если он свободен
+    между ходами, или довеском к уже идущему ходу, если он ещё работает (без
+    ожидания и без нового subprocess). Уже начатый tool-вызов это не обрывает
+    — довесок подхватывается сразу после него."""
+    worker = persistent_workers.get(key)
+    if worker is not None and (worker.dead or worker.proc.returncode is not None):
+        persistent_workers.pop(key, None)
+        worker = None
+
+    pending_summary_delivered = False
+    if worker is None:
+        session_id, cwd, engine_name, opened_new = ensure_active_session(*key)
+        if engine_name != "claude":
+            # /engine сменили мимо /persistent — тихий fallback на обычный путь.
+            await _process_prompt_locked(chat, thread_id, key, user_text, meta_block)
+            return
+        model = get_model(*key)
+
+        if opened_new:
+            try:
+                await send_to_topic(
+                    chat, thread_id,
+                    f"🆕 Новый сеанс ({engine_name}). Контекст прошлых разговоров "
+                    "не загружен — попроси поднять историю, если нужно.",
+                )
+            except Exception:
+                logger.exception("failed to send new-session notice key=%s", key)
+
+        pending_raw = get_pending_summary(*key)
+        pending_summary = None
+        if pending_raw:
+            pending_summary = await _resolve_pending_summary(key, pending_raw)
+
+        mcp_playwright = get_mcp_playwright(*key)
+        effective_cwd = cwd or CLAUDE_CWD
+        system_prefix = build_system_prefix(effective_cwd, mcp_playwright, key=key)
+
+        try:
+            worker = await start_persistent_claude(
+                key=key, session_id=session_id, cwd=effective_cwd, model=model,
+                system_prefix=system_prefix, mcp_playwright=mcp_playwright,
+            )
+        except Exception as exc:
+            logger.exception("persistent worker spawn failed key=%s", key)
+            await send_to_topic(
+                chat, thread_id, f"⚠️ Не удалось поднять живой процесс claude: {exc}",
+            )
+            return
+        persistent_workers[key] = worker
+
+        prompt_parts: list[str] = []
+        if pending_summary:
+            prompt_parts.append("[Контекст:]\n" + pending_summary)
+            pending_summary_delivered = True
+        if meta_block:
+            prompt_parts.append(meta_block)
+        prompt_parts.append("---\n\nСообщение пользователя:\n" + user_text)
+        prompt = "\n\n".join(prompt_parts)
+    else:
+        prompt_parts = [meta_block] if meta_block else []
+        prompt_parts.append("---\n\nСообщение пользователя:\n" + user_text)
+        prompt = "\n\n".join(prompt_parts)
+
+    is_new, fut = await worker.submit(prompt)
+
+    if not is_new:
+        try:
+            await send_to_topic(
+                chat, thread_id,
+                "✅ Добавил к тому, над чем сейчас работаю — учту сразу после текущего шага.",
+            )
+        except Exception:
+            logger.exception("failed to send persistent-append ack key=%s", key)
+        return
+
+    journal = ProgressJournal(chat, thread_id)
+    await journal.start()
+    worker.on_intermediate = journal.append
+    try:
+        ok, final_text = await asyncio.wait_for(fut, timeout=CLAUDE_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("persistent worker timeout key=%s", key)
+        await _kill_persistent_worker(key, "")
+        ok, final_text = False, f"Timeout: живой claude не ответил за {CLAUDE_TIMEOUT}с."
+    except Exception as exc:
+        logger.exception("persistent worker await failed key=%s", key)
+        ok, final_text = False, f"Внутренняя ошибка: {exc}"
+    finally:
+        if worker is not None:
+            worker.on_intermediate = None
+
+    if ok and pending_summary_delivered:
+        clear_pending_summary(*key)
+
+    await _finish_turn_reply(chat, thread_id, journal, ok, final_text, "claude", key)
+    logger.info("persistent turn done: key=%s ok=%s", key, ok)
+
+
 async def _process_prompt(
     update: Update,
     user_text: str,
@@ -3088,8 +3428,8 @@ async def _process_prompt(
     log_message(chat.id, thread_id, "in", "user_text", in_text, tg_msg_id)
 
     # Агент ждёт ответа на ask_user? Тогда это сообщение — ОТВЕТ ему, а не новый
-    # запрос. Перехватываем ДО очереди и lock'а: агент держит lock, стоя в
-    # ask_user, и без перехвата ответ ушёл бы к нему вторым, отдельным ходом.
+    # запрос. Перехватываем ДО очереди и лока (или живого процесса) — агент
+    # стоит в ask_user, и без перехвата ответ ушёл бы к нему вторым, отдельным ходом.
     pending_ask = get_pending_ask(chat.id, thread_id)
     if pending_ask is not None and user_text.strip():
         if answer_ask(pending_ask["id"], user_text.strip(), via="text"):
@@ -3113,6 +3453,20 @@ async def _process_prompt(
             extra_lines.append(f"[Прикреплён файл: {p}]")
     meta_block = "\n".join(extra_lines)
 
+    # Живой процесс claude (/persistent on) — своя ветка, без topic-lock:
+    # сообщение, пришедшее пока агент работает, дописывается ему на лету.
+    _peek_sid, _peek_cwd, peek_engine_name = get_session(*key)
+    if peek_engine_name == "claude" and get_persistent_claude(*key):
+        await _handle_persistent_message(chat, thread_id, key, user_text, meta_block)
+        return
+
+    await _process_prompt_locked(chat, thread_id, key, user_text, meta_block)
+
+
+async def _process_prompt_locked(
+    chat, thread_id: int, key: tuple[int, int], user_text: str, meta_block: str,
+) -> None:
+    """Обычный путь: topic-lock, «в очереди», процесс движка на сообщение."""
     # Проверяем, занят ли lock. Если занят — сообщаем «в очереди» с кнопкой «Отменить».
     lock = _lock_for(key)
     queue_msg = None
@@ -3225,30 +3579,9 @@ async def _process_prompt(
             logger.exception("llm call crashed: key=%s engine=%s", key, engine.name)
             ok, final_text = False, f"Внутренняя ошибка: {exc}"
 
-        await journal.finish(final_text)
+        await _finish_turn_reply(chat, thread_id, journal, ok, final_text, engine.name, key)
 
-        if not ok and not final_text.strip():
-            logger.info("llm call stopped without final reply: key=%s engine=%s", key, engine.name)
-            final_text = (
-                f"{engine.name} не прислал финальный ответ "
-                "(процесс завершился без текста). "
-                "Попробуй /new для новой сессии или переключи движок через /engine."
-            )
-
-        # Извлекаем маркеры файлов и отправляем их отдельными документами.
-        cleaned_text, file_markers = extract_file_markers(final_text)
-        if not cleaned_text.strip():
-            cleaned_text = "(пустой ответ)" if not file_markers else "(см. вложения)"
-        meta = {"type": "claude_response", "engine": engine.name}
-        try:
-            await send_claude_reply(chat, thread_id, cleaned_text, meta)
-        except Exception:
-            logger.exception("failed to send llm reply: key=%s", key)
-        if file_markers:
-            await deliver_file_markers(chat, thread_id, file_markers)
-
-        logger.info("lock released: key=%s ok=%s files=%d engine=%s",
-                    key, ok, len(file_markers), engine.name)
+        logger.info("lock released: key=%s ok=%s engine=%s", key, ok, engine.name)
     finally:
         try:
             lock.release()
@@ -3876,6 +4209,7 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("bind", "привязать топик к каталогу — /bind <abs path>"),
     BotCommand("unbind", "снять привязку cwd, вернуть дефолт"),
     BotCommand("where", "показать эффективный cwd"),
+    BotCommand("persistent", "живой процесс claude: сообщения на лету, без очереди"),
     BotCommand("start", "приветствие и состояние топика"),
 ]
 
@@ -3915,6 +4249,10 @@ async def _post_init(application: Application) -> None:
     # TTL — env JARVIS_LOG_TTL_DAYS (дефолт 30, 0/none/off отключает).
     cleanup_task = asyncio.create_task(cleanup_worker(application))
     application.bot_data["cleanup_worker_task"] = cleanup_task
+
+    # /persistent: убивает простаивающие живые процессы claude.
+    persistent_reaper_task = asyncio.create_task(persistent_reaper(application))
+    application.bot_data["persistent_reaper_task"] = persistent_reaper_task
 
     # Health: следит за долгими in_progress jobs, шлёт Менеджеру нотисы.
     # Параметры в env JARVIS_HEARTBEAT_INTERVAL/WARN/FAIL (300/900/3600с).
@@ -3976,6 +4314,7 @@ def main() -> None:
     app.add_handler(CommandHandler("close", cmd_close, filters=allowed))
     app.add_handler(CommandHandler("engine", cmd_engine, filters=allowed))
     app.add_handler(CommandHandler("browser", cmd_browser, filters=allowed))
+    app.add_handler(CommandHandler("persistent", cmd_persistent, filters=allowed))
     app.add_handler(CommandHandler("bind", cmd_bind, filters=allowed))
     app.add_handler(CommandHandler("unbind", cmd_unbind, filters=allowed))
     app.add_handler(CommandHandler("where", cmd_where, filters=allowed))
@@ -3989,6 +4328,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_engine_carry, pattern=r"^engine_carry:"))
     app.add_handler(CallbackQueryHandler(on_ask_answer, pattern=r"^ask:"))
     app.add_handler(CallbackQueryHandler(on_browser_toggle, pattern=r"^browser_toggle:"))
+    app.add_handler(CallbackQueryHandler(on_persistent_toggle, pattern=r"^persistent_toggle:"))
 
     app.add_handler(MessageHandler(~allowed, unauthorized_handler))
 
