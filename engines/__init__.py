@@ -14,9 +14,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
 from contextlib import contextmanager
 from typing import Protocol, Awaitable, Callable, Iterator
+
+logger = logging.getLogger(__name__)
 
 # Набор возможных движков. Добавляется при расширении.
 ENGINE_CLAUDE = "claude"
@@ -30,7 +34,13 @@ class Engine(Protocol):
 
     name: str            # "claude" | "codex" | "opencode"
     bin_path: str        # путь/имя бинаря CLI (для shutil.which)
-    models: list[str]    # доступные модели; пустой список = «модель не выбирается»
+
+    # Реально доступные модели — property поверх TTL-кэша (engines/model_cache.py):
+    # адаптер спрашивает свой CLI (env-override → конфиг/кэш CLI → `<cli> models`),
+    # при осечке отдаёт свой дефолт. Пустой список = «модель не выбирается».
+    models: list[str]
+
+    def prewarm_models(self) -> None: ...   # заполнить кэш моделей; блокирует
 
     def new_session_id(self) -> str: ...
     def session_exists(self, session_id: str, cwd: str) -> bool: ...
@@ -125,6 +135,23 @@ def ensure_engine_tools(engine: Engine) -> tuple[bool, str]:
     mgr_ok, mgr_status = ensure_jarvis_mcp(engine.name, engine.bin_path)
     pw_ok, pw_status = disable_global_playwright_mcp(engine.name, engine.bin_path)
     return mgr_ok and pw_ok, f"{mgr_status}; {pw_status}"
+
+
+def prewarm_models() -> None:
+    """Прогреть списки моделей всех установленных движков.
+
+    Опрос CLI занимает секунды (`opencode models` — ~1.5с), а `engine.models`
+    читают async-хендлеры Telegram. Зовётся из потока на старте бота, чтобы
+    первый /engine не ждал холодный кэш. Дальше кэш освежается фоном по TTL.
+    """
+    for name in SUPPORTED_ENGINES:
+        engine = get_engine_by_name(name)
+        if shutil.which(engine.bin_path) is None:
+            continue
+        try:
+            engine.prewarm_models()
+        except Exception:
+            logger.warning("prewarm models failed: engine=%s", name, exc_info=True)
 
 
 @contextmanager

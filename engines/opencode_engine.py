@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from engines.model_cache import cached_models, cli_models, prewarm, split_models
 from engines.process_control import terminate_process_tree
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,12 @@ logger = logging.getLogger(__name__)
 OPENCODE_BIN = os.environ.get("OPENCODE_BIN", "opencode")
 OPENCODE_TIMEOUT = int(os.environ.get("OPENCODE_TIMEOUT", "3600"))
 INTERMEDIATE_MIN_INTERVAL = 2.0
+
+# Фолбэк, если `opencode models` недоступен (CLI не установлен, нет сети).
+DEFAULT_OPENCODE_MODELS = [
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+]
 
 FILE_MARKER_SYSTEM = (
     "[SYSTEM NOTE FOR OPENCODE] Если нужно отправить пользователю файл "
@@ -202,13 +209,27 @@ def _tool_summary(part: dict[str, Any]) -> str:
     return str(name)
 
 
+def _discover_opencode_models() -> list[str]:
+    """`opencode models` печатает по строке на модель в виде provider/model —
+    берём то, что реально сконфигурировано у CLI (провайдеры, ключи, free-пул)."""
+    override = split_models(os.environ.get("OPENCODE_MODELS"))
+    if override:
+        return override
+    return [line for line in cli_models([OPENCODE_BIN, "models"]) if "/" in line]
+
+
 class OpenCodeEngine:
     name = "opencode"
     bin_path = OPENCODE_BIN
-    models: list[str] = [
-        "deepseek/deepseek-v4-flash",
-        "deepseek/deepseek-v4-pro",
-    ]
+
+    @property
+    def models(self) -> list[str]:
+        return cached_models(
+            "opencode", _discover_opencode_models, DEFAULT_OPENCODE_MODELS,
+        )
+
+    def prewarm_models(self) -> None:
+        prewarm("opencode", _discover_opencode_models, DEFAULT_OPENCODE_MODELS)
 
     def new_session_id(self) -> str:
         return f"{_PLACEHOLDER_PREFIX}{uuid.uuid4()}"

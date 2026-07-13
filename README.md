@@ -74,10 +74,12 @@ claude -p "hello"   # проверка, что авторизация работ
 - `OPENCODE_TIMEOUT` — таймаут opencode, секунд (по умолчанию `3600`).
 - `CODEX_MODEL` — дефолтная модель для Codex CLI, если в топике модель не
   выбрана явно через `/engine`.
-- `CODEX_MODELS` — запятая-разделённый список моделей для UI `/engine`.
-  Если не задан, Jarvis читает `~/.codex/models_cache.json`; если cache
-  недоступен, использует fallback:
-  `gpt-5.5,gpt-5.4,gpt-5.4-mini,gpt-5.3-codex,gpt-5.2`.
+- `CLAUDE_MODELS`, `CODEX_MODELS`, `OPENCODE_MODELS` — запятая-разделённые
+  списки моделей для UI `/engine`. Задавать не нужно: без них Jarvis
+  спрашивает списки у самих CLI (см. «Списки моделей» ниже), env — это
+  override, когда нужно показать только часть моделей или свою.
+- `JARVIS_MODELS_TTL` — как часто перечитывать списки моделей, секунд
+  (по умолчанию `600`).
 - `OPENCODE_MODEL`, `OPENCODE_AGENT`, `OPENCODE_VARIANT` — опциональные параметры
   для `opencode run`; если не заданы, используются настройки самого opencode.
 - `PLAYWRIGHT_MCP_NPX` — абсолютный путь к `npx` для Playwright MCP. Если не
@@ -266,6 +268,28 @@ options=[...])` публикует вопрос в топик и **блокир�
 - `codex` — best-effort estimate по размеру локального JSONL, потому что
   локальный session-log Codex CLI пока не даёт стабильного usage-поля.
 
+### Списки моделей
+
+Меню моделей в `/engine` не захардкожено — каждый адаптер спрашивает свой CLI
+(`engines/model_cache.py`):
+
+| Движок | Откуда берётся список |
+|---|---|
+| claude | алиасы `opus`/`sonnet`/`haiku` (CLI принимает их всегда) + `additionalModelOptionsCache` из `~/.claude.json` — то, что доступно аккаунту сверх алиасов, вроде `claude-fable-5[1m]` |
+| codex | `~/.codex/models_cache.json` (только модели с `visibility: list`) |
+| opencode | вывод `opencode models` — все сконфигурированные провайдеры |
+
+Env `CLAUDE_MODELS` / `CODEX_MODELS` / `OPENCODE_MODELS` перекрывают источник.
+Если источник молчит (CLI не установлен, конфиг битый), адаптер отдаёт свой
+фолбэк-список — меню не пустеет никогда.
+
+Опрос кэшируется на `JARVIS_MODELS_TTL` секунд (600). Он не мгновенный
+(`opencode models` — ~1.5с), а `engine.models` читают async-хендлеры, поэтому:
+кэш прогревается в потоке на старте (`prewarm_models()` в `_post_init`), а
+протухший список отдаётся сразу и обновляется фоновым потоком. Новый адаптер
+должен реализовать `models` (property) и `prewarm_models()` — проще всего через
+`cached_models()`/`prewarm()` из `engines/model_cache.py`.
+
 ### Как подключить новый движок
 
 Браузер on-demand — часть контракта `Engine.call_stream` (см.
@@ -374,6 +398,8 @@ journalctl --user -u jarvis-bot -f
 - `requirements.txt` — зависимости (`python-telegram-bot`, `python-dotenv`).
 - `engines/playwright_mcp.py` — runtime-настройка Playwright MCP для
   активного движка.
+- `engines/model_cache.py` — TTL-кэш списков моделей (движки спрашивают их
+  у своих CLI, а не хардкодят).
 - `bot_state.db` — sqlite: session-id на чат + метаданные исходящих сообщений (для reply-to).
 - `temp/media/` — скачанные пользовательские вложения.
 - `systemd/jarvis-bot.service` — user-unit.

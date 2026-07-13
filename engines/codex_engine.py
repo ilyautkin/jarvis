@@ -27,6 +27,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from engines.model_cache import cached_models, prewarm, split_models
 from engines.process_control import terminate_process_tree
 
 logger = logging.getLogger(__name__)
@@ -102,12 +103,6 @@ def _codex_sessions_root() -> Path:
     return Path.home() / ".codex" / "sessions"
 
 
-def _split_models(raw: str | None) -> list[str]:
-    if not raw:
-        return []
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
 def _models_from_codex_cache() -> list[str]:
     cache_path = Path(
         os.environ.get("CODEX_MODELS_CACHE", Path.home() / ".codex" / "models_cache.json")
@@ -132,17 +127,23 @@ def _models_from_codex_cache() -> list[str]:
     return models
 
 
-CODEX_MODELS = (
-    _split_models(os.environ.get("CODEX_MODELS"))
-    or _models_from_codex_cache()
-    or DEFAULT_CODEX_MODELS
-)
+def _discover_codex_models() -> list[str]:
+    return (
+        split_models(os.environ.get("CODEX_MODELS"))
+        or _models_from_codex_cache()
+    )
 
 
 class CodexEngine:
     name = "codex"
     bin_path = CODEX_BIN
-    models: list[str] = CODEX_MODELS
+
+    @property
+    def models(self) -> list[str]:
+        return cached_models("codex", _discover_codex_models, DEFAULT_CODEX_MODELS)
+
+    def prewarm_models(self) -> None:
+        prewarm("codex", _discover_codex_models, DEFAULT_CODEX_MODELS)
 
     # --- Session helpers ---
 

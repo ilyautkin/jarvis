@@ -55,6 +55,7 @@ from engines import (
     engine_model_scope,
     ensure_engine_tools,
     get_engine_by_name,
+    prewarm_models,
 )
 from engines.process_control import terminate_process_tree
 from engines.session_usage import SessionUsage, inspect_session_usage
@@ -2669,8 +2670,15 @@ def _engine_keyboard(current_engine: str) -> InlineKeyboardMarkup:
 
 
 def _model_label(model: str) -> str:
-    """Сокращение для отображения: 'deepseek/deepseek-v4-flash' → 'deepseek-v4-flash'."""
-    return model.split("/", 1)[-1] if "/" in model else model
+    """Сокращение для отображения: 'deepseek/deepseek-v4-flash' → 'deepseek-v4-flash'.
+
+    Провайдера прячем, только если он и так дублируется в имени модели: в списке
+    opencode рядом живут 'deepseek/deepseek-chat' и 'opencode/hy3-free', и у
+    второго провайдер — единственное, что говорит, чья это модель."""
+    provider, _, short = model.partition("/")
+    if short and short.startswith(provider):
+        return short
+    return model
 
 
 def _model_keyboard(engine_name: str, models: list[str]) -> InlineKeyboardMarkup:
@@ -4239,6 +4247,12 @@ async def _post_init(application: Application) -> None:
         logger.info("default menu button set to MenuButtonCommands")
     except Exception:
         logger.exception("set_chat_menu_button failed (меню не критично)")
+
+    # Списки моделей движков спрашиваются у их CLI (engines/model_cache.py).
+    # Прогреваем в потоке, чтобы первый /engine не ждал `opencode models`.
+    application.bot_data["models_prewarm_task"] = asyncio.create_task(
+        asyncio.to_thread(prewarm_models)
+    )
 
     # Запускаем worker для очереди jobs (delegations from Manager via MCP).
     # Хранить ссылку в bot_data на случай нужды в shutdown'е/тестах.

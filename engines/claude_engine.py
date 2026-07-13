@@ -21,6 +21,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from engines.model_cache import cached_models, prewarm, split_models
 from engines.process_control import terminate_process_tree
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,9 @@ logger = logging.getLogger(__name__)
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "3600"))
 INTERMEDIATE_MIN_INTERVAL = 2.0
+
+# Алиасы последних моделей: CLI принимает их всегда, независимо от аккаунта.
+DEFAULT_CLAUDE_MODELS = ["opus", "sonnet", "haiku"]
 
 APPEND_SYSTEM_PROMPT = (
     "Если нужно отправить пользователю файл (скриншот, собранный пакет, "
@@ -283,19 +287,54 @@ async def start_persistent(
     return worker
 
 
+def _models_from_claude_config() -> list[str]:
+    """Модели, доступные аккаунту сверх базовых алиасов.
+
+    Полного списка claude CLI наружу не отдаёт (команды `claude models` нет),
+    но то, что доступно сверх алиасов, кладёт в ~/.claude.json →
+    additionalModelOptionsCache: полные имена вроде 'claude-fable-5[1m]', для
+    которых короткого алиаса не существует.
+    """
+    cfg_path = Path(
+        os.environ.get("CLAUDE_CONFIG_FILE", Path.home() / ".claude.json")
+    )
+    if not cfg_path.is_file():
+        return []
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("cannot read claude config: %s", cfg_path, exc_info=True)
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    models: list[str] = []
+    for item in data.get("additionalModelOptionsCache", []) or []:
+        if not isinstance(item, dict):
+            continue
+        value = item.get("value")
+        if isinstance(value, str) and value:
+            models.append(value)
+    return models
+
+
+def _discover_claude_models() -> list[str]:
+    return (
+        split_models(os.environ.get("CLAUDE_MODELS"))
+        or DEFAULT_CLAUDE_MODELS + _models_from_claude_config()
+    )
+
+
 class ClaudeEngine:
     name = "claude"
     bin_path = CLAUDE_BIN
-    # CLI принимает алиасы ('opus', 'sonnet', 'haiku') и полные имена
-    # ('claude-opus-4-7', 'claude-opus-4-7[1m]', ...). Алиасы держим как
-    # дефолт, а вариант 1M-окна добавляем полным именем — короткого алиаса для
-    # него нет.
-    models: list[str] = [
-        "opus",
-        "claude-opus-4-7[1m]",
-        "sonnet",
-        "haiku",
-    ]
+
+    @property
+    def models(self) -> list[str]:
+        return cached_models("claude", _discover_claude_models, DEFAULT_CLAUDE_MODELS)
+
+    def prewarm_models(self) -> None:
+        prewarm("claude", _discover_claude_models, DEFAULT_CLAUDE_MODELS)
 
     # --- Session filesystem helpers ---
 
