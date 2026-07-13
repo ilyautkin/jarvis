@@ -6,9 +6,21 @@ import json
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# Приблизительные цены (USD за 1M токенов): (input, output, cache_write, cache_read).
+# Официального total_cost_usd в jsonl-транскрипте нет (он есть только в живом
+# stream-json от CLI и никуда не сохраняется) — считаем сами по учтённым тарифам.
+# Для моделей не из списка цена не считается (см. PeriodUsage.unpriced_tokens).
+MODEL_PRICING: dict[str, tuple[float, float, float, float]] = {
+    "claude-sonnet-5": (3.00, 15.00, 3.75, 0.30),
+    "claude-opus-4-8": (15.00, 75.00, 18.75, 1.50),
+    "claude-opus-4-8[1m]": (15.00, 75.00, 18.75, 1.50),
+    "claude-haiku-4-5-20251001": (1.00, 5.00, 1.25, 0.10),
+}
 
 
 @dataclass
@@ -44,6 +56,161 @@ def inspect_session_usage(engine: str, session_id: str, cwd: str | None) -> Sess
     if engine == "opencode":
         return _inspect_opencode(session_id)
     return SessionUsage(engine=engine, session_id=session_id, source="unknown")
+
+
+@dataclass
+class ModelTotals:
+    n_messages: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+
+
+@dataclass
+class PeriodUsage:
+    """Сумма usage по ВСЕМ сообщениям сессии (и её сабагентов) за период —
+    в отличие от SessionUsage, который берёт только последний снэпшот
+    (нужен для порога автокомпакта, а не для учёта расхода)."""
+
+    engine: str
+    session_id: str
+    since: datetime | None
+    until: datetime | None
+    by_model: dict[str, ModelTotals] = field(default_factory=dict)
+    files_scanned: list[str] = field(default_factory=list)
+    note: str | None = None
+
+    @property
+    def n_messages(self) -> int:
+        return sum(m.n_messages for m in self.by_model.values())
+
+    @property
+    def input_tokens(self) -> int:
+        return sum(m.input_tokens for m in self.by_model.values())
+
+    @property
+    def output_tokens(self) -> int:
+        return sum(m.output_tokens for m in self.by_model.values())
+
+    @property
+    def cache_write_tokens(self) -> int:
+        return sum(m.cache_write_tokens for m in self.by_model.values())
+
+    @property
+    def cache_read_tokens(self) -> int:
+        return sum(m.cache_read_tokens for m in self.by_model.values())
+
+    @property
+    def cost_usd(self) -> float:
+        total = 0.0
+        for model, m in self.by_model.items():
+            price = MODEL_PRICING.get(model)
+            if not price:
+                continue
+            p_in, p_out, p_cw, p_cr = price
+            total += (
+                m.input_tokens * p_in
+                + m.output_tokens * p_out
+                + m.cache_write_tokens * p_cw
+                + m.cache_read_tokens * p_cr
+            ) / 1_000_000
+        return total
+
+    @property
+    def unpriced_models(self) -> list[str]:
+        return [m for m in self.by_model if m not in MODEL_PRICING]
+
+
+def _parse_ts(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def aggregate_claude_usage(
+    session_id: str,
+    cwd: str | None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    include_subagents: bool = True,
+) -> PeriodUsage:
+    """Просуммировать usage всех ответов ассистента в jsonl-транскрипте данной
+    сессии (+ её сабагентов, запущенных через Task) за [since, until].
+
+    Область — конкретный ``session_id``, а не вся папка проекта: если та же
+    cwd используется другим топиком/терминальной сессией, её токены сюда не
+    попадут. Обратная сторона: сессии topика ДО последнего /new не видны —
+    в БД бота хранится только текущий session_id на топик."""
+    effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
+    session_dir = _claude_sessions_dir_for(effective_cwd)
+    result = PeriodUsage(engine="claude", session_id=session_id, since=since, until=until)
+
+    main_file = session_dir / f"{session_id}.jsonl"
+    files = [main_file] if main_file.is_file() else []
+    if include_subagents:
+        sub_dir = session_dir / session_id / "subagents"
+        if sub_dir.is_dir():
+            files.extend(sorted(sub_dir.glob("*.jsonl")))
+
+    if not files:
+        result.note = f"no transcript files found under {session_dir}"
+        return result
+
+    for path in files:
+        result.files_scanned.append(str(path))
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"usage"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = _parse_ts(row.get("timestamp"))
+                    if ts is None:
+                        continue
+                    if since is not None and ts < since:
+                        continue
+                    if until is not None and ts > until:
+                        continue
+                    msg = row.get("message")
+                    if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
+                        continue
+                    usage = msg.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    model = msg.get("model") or "unknown"
+                    bucket = result.by_model.setdefault(model, ModelTotals())
+                    bucket.n_messages += 1
+                    bucket.input_tokens += int(usage.get("input_tokens") or 0)
+                    bucket.output_tokens += int(usage.get("output_tokens") or 0)
+                    bucket.cache_write_tokens += int(usage.get("cache_creation_input_tokens") or 0)
+                    bucket.cache_read_tokens += int(usage.get("cache_read_input_tokens") or 0)
+        except OSError as exc:
+            result.note = f"read failed for {path}: {exc}"
+    return result
+
+
+def aggregate_usage(
+    engine: str,
+    session_id: str,
+    cwd: str | None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> PeriodUsage:
+    engine = (engine or "").strip().lower()
+    if engine == "claude":
+        return aggregate_claude_usage(session_id, cwd, since, until)
+    return PeriodUsage(
+        engine=engine, session_id=session_id, since=since, until=until,
+        note=f"period aggregation not implemented for engine={engine!r}",
+    )
 
 
 def _estimate_tokens_from_bytes(size: int | None) -> int | None:
