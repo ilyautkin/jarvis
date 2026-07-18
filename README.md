@@ -23,6 +23,10 @@
   По умолчанию **выключен** (on-demand): браузерные tools грузятся в контекст
   только там, где реально нужны — иначе ~30 `browser_*` тулов висят в каждом
   запросе и зря жгут токены.
+- `/persistent [on|off]` — живой процесс для `claude` и `codex`: новое
+  сообщение во время активного хода не ждёт topic-lock, а дописывается в
+  текущую работу (`claude` через stream-json stdin, `codex` через app-server
+  `turn/steer`). Для `opencode` не поддержано.
 - **Журнал хода** — шаги агента (инструменты, рассуждения, промежуточный текст)
   копятся в одном сообщении и **остаются** в топике после ответа. Раньше они
   писались в индикатор, где каждый апдейт затирал предыдущий, а в конце
@@ -196,6 +200,37 @@ options=[...])` публикует вопрос в топик и **блокир�
 Системный `[SYSTEM:]`-блок велит агенту звать `ask_user` перед опасными или
 необратимыми действиями и при неоднозначной задаче — и не дёргать человека по
 тому, что можно выяснить самому (прочитать код, запустить команду, глянуть git).
+
+### Живой процесс `/persistent`
+
+Обычный путь Jarvis сериализует сообщения в топике через topic-lock: если агент
+уже работает, следующее сообщение ждёт очереди. `/persistent on` включает
+исключение для текущего движка (`claude` или `codex`): живой subprocess держится
+между ходами, а сообщение, пришедшее во время активного хода, отправляется в
+него сразу и подтверждается фразой «добавил к текущей работе».
+
+- `claude`: запускается `claude --print --input-format stream-json
+  --output-format stream-json`; новые сообщения пишутся в stdin.
+- `codex`: запускается experimental `codex app-server --listen stdio://`.
+  Jarvis делает JSON-RPC `initialize` с `experimentalApi: true`, затем
+  `thread/start` или `thread/resume`; новый ход идёт через `turn/start`, а
+  сообщение во время активного хода — через `turn/steer` с `expectedTurnId`.
+- `opencode`: persistent-режим не поддержан.
+
+Важно для Codex: `codex exec` не подходит для true persistent. Проверено на
+`codex-cli 0.131.0`: `codex exec --input-format stream-json --help` падает с
+`unexpected argument '--input-format'`; `codex exec --json -` без EOF не
+стартует как интерактивный поток; `codex exec --json 'Reply exactly: OK'`
+делает один turn и завершает процесс. При этом `codex app-server --listen
+stdio://` отвечает на `initialize`, создаёт thread через `thread/start`, даёт
+`inProgress` turn через `turn/start` и принимает `turn/steer` во время активного
+turn.
+
+Playwright MCP в persistent Codex подключается теми же `-c
+mcp_servers.playwright.*` overrides при старте app-server. Флаг `/browser`
+нужно включать до первого persistent-сообщения в топике: уже запущенный живой
+процесс не перечитывает MCP-конфиг до перезапуска worker-а (`/stop`, `/new`,
+`/reset`, `/engine`, `/persistent off/on` или idle reaper).
 
 ### Что видно из рассуждений агента
 
