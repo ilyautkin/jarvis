@@ -9,7 +9,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from engines.session_usage import aggregate_claude_usage
-from telegram_bot import _looks_like_task_done, _looks_like_waiting_for_user
+from telegram_bot import (
+    _done_confirm_keyboard,
+    _looks_like_task_done,
+    _looks_like_waiting_for_user,
+    _session_confirm_token,
+)
 
 
 class DoneDetectorTest(unittest.TestCase):
@@ -44,6 +49,19 @@ class DoneDetectorTest(unittest.TestCase):
         for text in samples:
             with self.subTest(text=text):
                 self.assertFalse(_looks_like_task_done(text))
+
+    def test_done_confirm_keyboard_uses_short_session_token(self) -> None:
+        session_id = "placeholder-36e972de-0504-4d32-9c19-6eb67879d72c"
+        token = _session_confirm_token(session_id)
+        self.assertEqual(len(token), 12)
+
+        keyboard = _done_confirm_keyboard(session_id)
+        buttons = keyboard.inline_keyboard[0]
+        callback_data = [button.callback_data for button in buttons]
+
+        self.assertEqual(callback_data[0], f"done_confirm:{token}:yes")
+        self.assertEqual(callback_data[1], f"done_confirm:{token}:no")
+        self.assertLessEqual(max(len(item) for item in callback_data), 64)
 
 
 class ClaudeUsageAggregationTest(unittest.TestCase):

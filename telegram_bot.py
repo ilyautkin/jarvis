@@ -15,6 +15,7 @@
 import os
 import re
 import json
+import hashlib
 import shutil
 import uuid
 import secrets
@@ -100,7 +101,10 @@ TG_FILE_LIMIT_MB = 50      # Telegram Bot API лимит на sendDocument
 # (cwd, движок, модель) переживает закрытие, контекст сессии — нет.
 SESSION_IDLE_MINUTES = _int_env_raw("JARVIS_SESSION_IDLE_MINUTES", 180)
 CONTEXT_WARN_TOKENS = _int_env_raw("JARVIS_CONTEXT_WARN_TOKENS", 150_000)
-AUTOCLOSE_ON_DONE = _bool_env_raw("JARVIS_AUTOCLOSE_ON_DONE", True)
+DONE_CONFIRM_ON_DONE = _bool_env_raw(
+    "JARVIS_DONE_CONFIRM_ON_DONE",
+    _bool_env_raw("JARVIS_AUTOCLOSE_ON_DONE", True),
+)
 
 # Маркер для отправки файлов из LLM-сессии: [[FILE: /abs/path]] или [[FILE: /path | подпись]].
 # Должен стоять на отдельной строке (но допускаются пробелы вокруг).
@@ -2743,6 +2747,70 @@ async def on_persistent_toggle(update: Update, context: ContextTypes.DEFAULT_TYP
         await send_to_topic(update.effective_chat, key[1], text)
 
 
+async def on_done_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Колбэк кнопки done_confirm:<session_token>:<yes|no>."""
+    query = update.callback_query
+    data = query.data or ""
+    if not data.startswith("done_confirm:"):
+        return
+    try:
+        _prefix, token, action = data.split(":", 2)
+    except ValueError:
+        try:
+            await query.answer("Некорректная кнопка", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    key = _key(update)
+    session_id, cwd, engine_name = get_session(*key)
+    if token != _session_confirm_token(session_id):
+        text = "Эта кнопка относится к старой сессии. Текущую сессию не трогаю."
+        try:
+            await query.answer(text, show_alert=True)
+        except Exception:
+            pass
+        try:
+            await query.edit_message_text(text)
+        except BadRequest:
+            await send_to_topic(update.effective_chat, key[1], text)
+        return
+
+    if action != "yes":
+        text = "Ок, продолжаем в текущей сессии."
+        try:
+            await query.answer("Продолжаем")
+        except Exception:
+            pass
+        try:
+            await query.edit_message_text(text)
+        except BadRequest:
+            await send_to_topic(update.effective_chat, key[1], text)
+        return
+
+    try:
+        await query.answer("Закрываю сессию")
+    except Exception:
+        pass
+    await _kill_persistent_worker(key, "сессия закрыта по подтверждению завершения задачи")
+    was_open = close_session(key[0], key[1])
+    if was_open:
+        text = (
+            "✅ Сессия закрыта после подтверждения завершения задачи. "
+            "Следующее сообщение откроет новую."
+        )
+    else:
+        text = "Сессия уже закрыта. Следующее сообщение откроет новую."
+    logger.info(
+        "done confirmation: key=%s engine=%s cwd=%s action=yes closed=%s",
+        key, engine_name, cwd or CLAUDE_CWD, was_open,
+    )
+    try:
+        await query.edit_message_text(text)
+    except BadRequest:
+        await send_to_topic(update.effective_chat, key[1], text)
+
+
 def _engine_keyboard(current_engine: str) -> InlineKeyboardMarkup:
     """Inline-клавиатура с кнопками выбора движка. Текущий помечается ✓."""
     row = []
@@ -2918,6 +2986,18 @@ def _looks_like_task_done(text: str) -> bool:
     return bool(_DONE_RE.search(text or ""))
 
 
+def _session_confirm_token(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _done_confirm_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    token = _session_confirm_token(session_id)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да, закрыть", callback_data=f"done_confirm:{token}:yes"),
+        InlineKeyboardButton("Нет", callback_data=f"done_confirm:{token}:no"),
+    ]])
+
+
 async def _warn_large_context_if_needed(
     chat, thread_id: int, engine_name: str, session_id: str, cwd: str | None, key: tuple[int, int],
 ) -> None:
@@ -2943,21 +3023,19 @@ async def _warn_large_context_if_needed(
         logger.exception("failed to send context warning: key=%s", key)
 
 
-async def _autoclose_done_session_if_needed(
-    chat, thread_id: int, ok: bool, final_text: str, key: tuple[int, int],
+async def _ask_done_confirmation_if_needed(
+    chat, thread_id: int, ok: bool, final_text: str, session_id: str, key: tuple[int, int],
 ) -> None:
-    if not (AUTOCLOSE_ON_DONE and ok and _looks_like_task_done(final_text)):
-        return
-    await _kill_persistent_worker(key, "сессия закрыта после завершения задачи")
-    if not close_session(key[0], key[1]):
+    if not (DONE_CONFIRM_ON_DONE and ok and _looks_like_task_done(final_text)):
         return
     try:
         await send_to_topic(
             chat, thread_id,
-            "✅ Сессия закрыта после завершения задачи. Следующее сообщение откроет новую.",
+            "Задача завершена? Закрыть сессию, чтобы следующий ход начал новый контекст?",
+            reply_markup=_done_confirm_keyboard(session_id),
         )
     except Exception:
-        logger.exception("failed to send autoclose notice: key=%s", key)
+        logger.exception("failed to send done confirmation: key=%s", key)
 
 
 def _inspect_topic_usage(key: tuple[int, int]) -> SessionUsage:
@@ -3475,7 +3553,7 @@ async def _finish_turn_reply(
     await _warn_large_context_if_needed(
         chat, thread_id, current_engine_name or engine_name, session_id, cwd, key,
     )
-    await _autoclose_done_session_if_needed(chat, thread_id, ok, final_text, key)
+    await _ask_done_confirmation_if_needed(chat, thread_id, ok, final_text, session_id, key)
 
 
 async def _handle_persistent_message(
@@ -4523,6 +4601,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_ask_answer, pattern=r"^ask:"))
     app.add_handler(CallbackQueryHandler(on_browser_toggle, pattern=r"^browser_toggle:"))
     app.add_handler(CallbackQueryHandler(on_persistent_toggle, pattern=r"^persistent_toggle:"))
+    app.add_handler(CallbackQueryHandler(on_done_confirm, pattern=r"^done_confirm:"))
 
     app.add_handler(MessageHandler(~allowed, unauthorized_handler))
 
