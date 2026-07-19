@@ -131,6 +131,20 @@ def _parse_ts(raw: Any) -> datetime | None:
         return None
 
 
+def _claude_usage_dedupe_key(row: dict[str, Any], msg: dict[str, Any]) -> str | None:
+    for key in ("requestId", "request_id"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return f"request:{value}"
+    value = msg.get("id")
+    if isinstance(value, str) and value:
+        return f"message:{value}"
+    value = row.get("uuid")
+    if isinstance(value, str) and value:
+        return f"uuid:{value}"
+    return None
+
+
 def aggregate_claude_usage(
     session_id: str,
     cwd: str | None,
@@ -160,6 +174,8 @@ def aggregate_claude_usage(
         result.note = f"no transcript files found under {session_dir}"
         return result
 
+    seen_usage_keys: set[str] = set()
+    duplicate_usage_rows = 0
     for path in files:
         result.files_scanned.append(str(path))
         try:
@@ -185,6 +201,13 @@ def aggregate_claude_usage(
                     usage = msg.get("usage")
                     if not isinstance(usage, dict):
                         continue
+                    dedupe_key = _claude_usage_dedupe_key(row, msg)
+                    if dedupe_key is not None:
+                        scoped_key = f"{row.get('sessionId') or session_id}:{dedupe_key}"
+                        if scoped_key in seen_usage_keys:
+                            duplicate_usage_rows += 1
+                            continue
+                        seen_usage_keys.add(scoped_key)
                     model = msg.get("model") or "unknown"
                     bucket = result.by_model.setdefault(model, ModelTotals())
                     bucket.n_messages += 1
@@ -194,6 +217,8 @@ def aggregate_claude_usage(
                     bucket.cache_read_tokens += int(usage.get("cache_read_input_tokens") or 0)
         except OSError as exc:
             result.note = f"read failed for {path}: {exc}"
+    if duplicate_usage_rows and result.note is None:
+        result.note = f"deduplicated {duplicate_usage_rows} repeated Claude usage rows"
     return result
 
 

@@ -84,6 +84,13 @@ def _int_env_raw(name: str, default: int) -> int:
         return default
 
 
+def _bool_env_raw(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 MSG_LIMIT = 3500           # порог отправки ответа как документ
 TG_HARD_LIMIT = 4096       # жёсткий лимит Telegram
 TG_FILE_LIMIT_MB = 50      # Telegram Bot API лимит на sendDocument
@@ -92,6 +99,8 @@ TG_FILE_LIMIT_MB = 50      # Telegram Bot API лимит на sendDocument
 # /close или сам — после SESSION_IDLE_MINUTES без активности в топике. Топик
 # (cwd, движок, модель) переживает закрытие, контекст сессии — нет.
 SESSION_IDLE_MINUTES = _int_env_raw("JARVIS_SESSION_IDLE_MINUTES", 180)
+CONTEXT_WARN_TOKENS = _int_env_raw("JARVIS_CONTEXT_WARN_TOKENS", 150_000)
+AUTOCLOSE_ON_DONE = _bool_env_raw("JARVIS_AUTOCLOSE_ON_DONE", True)
 
 # Маркер для отправки файлов из LLM-сессии: [[FILE: /abs/path]] или [[FILE: /path | подпись]].
 # Должен стоять на отдельной строке (но допускаются пробелы вокруг).
@@ -2878,6 +2887,79 @@ def _usage_line(usage: SessionUsage) -> str:
     return "; ".join(bits)
 
 
+_DONE_RE = re.compile(
+    r"\b("
+    r"готово|итог|выполнено|закрыто|задеплоено|задеплоил|деплой\s+выполнен|"
+    r"проверено|проверил|закоммитил|коммит|commit|deploy(?:ed|ment)?|"
+    r"implemented|done|fixed"
+    r")\b",
+    re.IGNORECASE,
+)
+_WAIT_RE = re.compile(
+    r"("
+    r"жду|подтверди|подтвердите|можно(?:\s+[^?\n]{1,40})?\?|что\s+дальше\?|отправлять\?|"
+    r"согласовать|согласуй|нужно\s+подтверждение|нужен\s+ответ|"
+    r"уточни|уточните|нужно\s+уточнить|ожидаю|#ask_\d+|waiting|confirm|approve"
+    r")",
+    re.IGNORECASE,
+)
+_NOT_DONE_RE = re.compile(r"\b(не\s+готово|не\s+выполнено|не\s+закрыто|not\s+done)\b", re.IGNORECASE)
+
+
+def _looks_like_waiting_for_user(text: str) -> bool:
+    return bool(_WAIT_RE.search(text or ""))
+
+
+def _looks_like_task_done(text: str) -> bool:
+    if _looks_like_waiting_for_user(text):
+        return False
+    if _NOT_DONE_RE.search(text or ""):
+        return False
+    return bool(_DONE_RE.search(text or ""))
+
+
+async def _warn_large_context_if_needed(
+    chat, thread_id: int, engine_name: str, session_id: str, cwd: str | None, key: tuple[int, int],
+) -> None:
+    if CONTEXT_WARN_TOKENS <= 0:
+        return
+    try:
+        usage = inspect_session_usage(engine_name, session_id, cwd or CLAUDE_CWD)
+    except Exception:
+        logger.exception("session usage inspection failed: key=%s engine=%s session=%s",
+                         key, engine_name, session_id)
+        return
+    tokens = usage.threshold_tokens
+    if tokens is None or tokens < CONTEXT_WARN_TOKENS:
+        return
+    try:
+        await send_to_topic(
+            chat, thread_id,
+            "⚠️ Большой контекст: "
+            f"{_usage_line(usage)}. "
+            "Если задача завершена, используй /new или /close, чтобы следующий ход не тянул старую историю.",
+        )
+    except Exception:
+        logger.exception("failed to send context warning: key=%s", key)
+
+
+async def _autoclose_done_session_if_needed(
+    chat, thread_id: int, ok: bool, final_text: str, key: tuple[int, int],
+) -> None:
+    if not (AUTOCLOSE_ON_DONE and ok and _looks_like_task_done(final_text)):
+        return
+    await _kill_persistent_worker(key, "сессия закрыта после завершения задачи")
+    if not close_session(key[0], key[1]):
+        return
+    try:
+        await send_to_topic(
+            chat, thread_id,
+            "✅ Сессия закрыта после завершения задачи. Следующее сообщение откроет новую.",
+        )
+    except Exception:
+        logger.exception("failed to send autoclose notice: key=%s", key)
+
+
 def _inspect_topic_usage(key: tuple[int, int]) -> SessionUsage:
     session_id, cwd, engine_name = get_session(*key)
     return inspect_session_usage(engine_name, session_id, cwd or CLAUDE_CWD)
@@ -3388,6 +3470,12 @@ async def _finish_turn_reply(
         logger.exception("failed to send llm reply: key=%s", key)
     if file_markers:
         await deliver_file_markers(chat, thread_id, file_markers)
+
+    session_id, cwd, current_engine_name = get_session(*key)
+    await _warn_large_context_if_needed(
+        chat, thread_id, current_engine_name or engine_name, session_id, cwd, key,
+    )
+    await _autoclose_done_session_if_needed(chat, thread_id, ok, final_text, key)
 
 
 async def _handle_persistent_message(
