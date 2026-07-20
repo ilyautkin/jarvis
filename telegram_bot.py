@@ -485,6 +485,31 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_jobs_pending "
             "ON jobs(status, not_before, created_at)"
         )
+        # Очередь внешних триггеров без job-семантики. Используется mxBoard
+        # poller-ом: нужно запустить обычный LLM turn в топике, но без job_id,
+        # health_worker, manager_interrupt и safety-notice Менеджеру на ответ
+        # или interrupt.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_triggers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'mxboard',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                claimed_at TEXT,
+                finished_at TEXT,
+                error TEXT,
+                result_message_id INTEGER
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_triggers_pending "
+            "ON agent_triggers(status, created_at)"
+        )
         # Напоминания Менеджеру (cron-light). schedule — простой текст,
         # парсится в _parse_schedule(): daily HH:MM, weekday HH:MM,
         # weekend HH:MM, weekly DAY[,DAY] HH:MM, monthly D HH:MM,
@@ -637,8 +662,62 @@ def finish_job(
         )
 
 
+def claim_next_agent_trigger(
+    exclude_keys: frozenset[tuple[int, int]] | None = None,
+) -> dict | None:
+    """Atomically claim one pending non-job trigger.
+
+    This queue is for mxBoard/poller handoff: run a normal LLM turn in the
+    topic, but do not create/finish a Jarvis job and do not emit job safety
+    notices.
+    """
+    now = datetime.utcnow().isoformat()
+    sql = (
+        "SELECT id, chat_id, thread_id, text, source FROM agent_triggers "
+        "WHERE status = 'pending'"
+    )
+    params: list[int | str] = []
+    for chat_id, thread_id in (exclude_keys or ()):
+        sql += " AND NOT (chat_id = ? AND thread_id = ?)"
+        params.extend([chat_id, thread_id])
+    sql += " ORDER BY created_at ASC, id ASC LIMIT 1"
+    with _db() as conn:
+        row = conn.execute(sql, params).fetchone()
+        if not row:
+            return None
+        cur = conn.execute(
+            "UPDATE agent_triggers SET status = 'in_progress', claimed_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (now, row[0]),
+        )
+        if cur.rowcount != 1:
+            return None
+    return {
+        "id": row[0],
+        "chat_id": row[1],
+        "thread_id": row[2],
+        "text": row[3],
+        "source": row[4],
+    }
+
+
+def finish_agent_trigger(
+    trigger_id: int,
+    status: str,
+    error: str | None = None,
+    result_message_id: int | None = None,
+) -> None:
+    """status: 'done' | 'failed'."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE agent_triggers SET status = ?, error = ?, result_message_id = ?, "
+            "finished_at = ? WHERE id = ?",
+            (status, error, result_message_id, datetime.utcnow().isoformat(), trigger_id),
+        )
+
+
 def _log_ttl_days() -> int:
-    """How long to retain messages_log + completed jobs. 0/'none'/'off' disables."""
+    """How long to retain logs + completed queues. 0/'none'/'off' disables."""
     raw = (os.environ.get("JARVIS_LOG_TTL_DAYS") or "30").strip().lower()
     if raw in {"0", "none", "off", "false", "no"}:
         return 0
@@ -651,13 +730,13 @@ def _log_ttl_days() -> int:
 
 
 def cleanup_old_log_entries(ttl_days: int) -> dict[str, int]:
-    """Delete messages_log entries and terminal-status jobs older than ttl_days.
+    """Delete messages_log entries and terminal-status queues older than ttl_days.
 
-    Pending jobs (incl. scheduled with future not_before) are NEVER deleted —
-    they may be valid auto-go timers. Returns counts of deleted rows.
+    Pending jobs/triggers are NEVER deleted: they may be valid queued work.
+    Returns counts of deleted rows.
     """
     if ttl_days <= 0:
-        return {"messages_log": 0, "jobs": 0}
+        return {"messages_log": 0, "jobs": 0, "agent_triggers": 0}
     threshold = (datetime.utcnow() - timedelta(days=ttl_days)).isoformat()
     with _db() as conn:
         log_n = conn.execute(
@@ -668,7 +747,12 @@ def cleanup_old_log_entries(ttl_days: int) -> dict[str, int]:
             "AND COALESCE(finished_at, created_at) < ?",
             (threshold,),
         ).rowcount
-    return {"messages_log": log_n, "jobs": jobs_n}
+        triggers_n = conn.execute(
+            "DELETE FROM agent_triggers WHERE status IN ('done', 'failed') "
+            "AND COALESCE(finished_at, created_at) < ?",
+            (threshold,),
+        ).rowcount
+    return {"messages_log": log_n, "jobs": jobs_n, "agent_triggers": triggers_n}
 
 
 async def cleanup_worker(app: Application) -> None:
@@ -686,10 +770,11 @@ async def cleanup_worker(app: Application) -> None:
     while True:
         try:
             stats = cleanup_old_log_entries(ttl)
-            if stats["messages_log"] or stats["jobs"]:
+            if stats["messages_log"] or stats["jobs"] or stats["agent_triggers"]:
                 logger.info(
-                    "cleanup_worker: pruned messages_log=%d jobs=%d (TTL=%dd)",
-                    stats["messages_log"], stats["jobs"], ttl,
+                    "cleanup_worker: pruned messages_log=%d jobs=%d "
+                    "agent_triggers=%d (TTL=%dd)",
+                    stats["messages_log"], stats["jobs"], stats["agent_triggers"], ttl,
                 )
             await asyncio.sleep(3600.0)
         except asyncio.CancelledError:
@@ -4374,6 +4459,108 @@ async def jobs_worker(app: Application) -> None:
             await asyncio.sleep(5.0)
 
 
+_inflight_trigger_keys: set[tuple[int, int]] = set()
+
+
+async def _process_agent_trigger(app: Application, trigger: dict) -> tuple[bool, str | None]:
+    """Run one non-job trigger through the normal topic LLM pipeline."""
+    chat_id = trigger["chat_id"]
+    thread_id = trigger["thread_id"]
+    key = (chat_id, thread_id)
+    text = trigger["text"]
+    source = trigger.get("source") or "external"
+    try:
+        chat = await app.bot.get_chat(chat_id)
+    except Exception:
+        logger.exception("agent trigger %s: bot.get_chat(%s) failed", trigger["id"], chat_id)
+        return False, "failed to resolve target chat via Telegram API"
+
+    log_message(chat_id, thread_id, "in", f"{source}_inject", text, None)
+
+    try:
+        _sid, _cwd, engine_name = get_session(*key)
+        if get_persistent_for_engine(*key, engine_name):
+            await _handle_persistent_message(chat, thread_id, key, text, "")
+        else:
+            await _process_prompt_locked(chat, thread_id, key, text, "")
+    except Exception as exc:
+        logger.exception("agent trigger %s crashed key=%s", trigger["id"], key)
+        return False, str(exc)[:1000]
+    return True, None
+
+
+async def _run_agent_trigger_slot(
+    app: Application,
+    trigger: dict,
+    key: tuple[int, int],
+    sem: asyncio.Semaphore,
+) -> None:
+    trigger_id = trigger["id"]
+    try:
+        ok, err_text = await _process_agent_trigger(app, trigger)
+        finish_agent_trigger(
+            trigger_id,
+            "done" if ok else "failed",
+            None if ok else (err_text or "engine returned no usable reply"),
+            None,
+        )
+    except asyncio.CancelledError:
+        finish_agent_trigger(trigger_id, "failed", "worker cancelled", None)
+        raise
+    except Exception as exc:
+        logger.exception("agent trigger %s crashed", trigger_id)
+        finish_agent_trigger(trigger_id, "failed", str(exc)[:1000], None)
+    finally:
+        _inflight_trigger_keys.discard(key)
+        sem.release()
+
+
+async def agent_triggers_worker(app: Application) -> None:
+    """Dispatcher for non-job external triggers.
+
+    Unlike jobs_worker, these turns have no job_id and are invisible to
+    manager_interrupt/health_worker. They are still serialized per topic by the
+    normal topic lock inside _process_prompt_locked/_handle_persistent_message.
+    """
+    concurrency = _env_int("JARVIS_AGENT_TRIGGERS_CONCURRENCY", 5, 1)
+    sem = asyncio.Semaphore(concurrency)
+    tasks: set[asyncio.Task] = set()
+    logger.info("agent_triggers_worker started (concurrency=%d)", concurrency)
+    while True:
+        acquired = False
+        try:
+            await sem.acquire()
+            acquired = True
+            exclude = frozenset(_inflight_trigger_keys | _inflight_job_keys)
+            trigger = claim_next_agent_trigger(exclude_keys=exclude)
+            if trigger is None:
+                sem.release()
+                acquired = False
+                await asyncio.sleep(2.0)
+                continue
+            key = (trigger["chat_id"], trigger["thread_id"])
+            _inflight_trigger_keys.add(key)
+            t = asyncio.create_task(_run_agent_trigger_slot(app, trigger, key, sem))
+            acquired = False
+            tasks.add(t)
+            t.add_done_callback(tasks.discard)
+        except asyncio.CancelledError:
+            if acquired:
+                sem.release()
+            logger.info(
+                "agent_triggers_worker cancelled; cancelling %d in-flight trigger(s)",
+                len(tasks),
+            )
+            for t in list(tasks):
+                t.cancel()
+            raise
+        except Exception:
+            if acquired:
+                sem.release()
+            logger.exception("agent_triggers_worker dispatcher crashed; sleeping 5s")
+            await asyncio.sleep(5.0)
+
+
 async def cmd_spawn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/spawn <prompt> — запустить одноразовую параллельную claude-сессию.
     Не блокируется lock'ом топика, не трогает основную сессию."""
@@ -4531,6 +4718,11 @@ async def _post_init(application: Application) -> None:
     # Хранить ссылку в bot_data на случай нужды в shutdown'е/тестах.
     task = asyncio.create_task(jobs_worker(application))
     application.bot_data["jobs_worker_task"] = task
+
+    # Non-job external triggers (mxBoard poller): обычный LLM turn в топике
+    # без job_id, health_worker и safety-notice Менеджеру.
+    trigger_task = asyncio.create_task(agent_triggers_worker(application))
+    application.bot_data["agent_triggers_worker_task"] = trigger_task
 
     # Гигиена: hourly cleanup старых записей messages_log + завершённых jobs.
     # TTL — env JARVIS_LOG_TTL_DAYS (дефолт 30, 0/none/off отключает).

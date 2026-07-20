@@ -124,14 +124,19 @@ claude -p "hello"   # проверка, что авторизация работ
 - `JARVIS_MXBOARD_MANAGER_USERNAME` / `JARVIS_MXBOARD_AGENT_USERNAME` — подписи
   ролей для логов, по умолчанию `ai-manager` / `ai-agent`. На авторизацию влияет
   токен, а не это имя.
-- `JARVIS_LOG_TTL_DAYS` — сколько дней хранить записи `messages_log` и
-  завершённые (`done`/`failed`/`cancelled`) `jobs`. Дефолт `30`. `0`,
-  `none`, `off`, `false`, `no` — отключают авто-cleanup. `pending` jobs
-  (включая scheduled с `not_before` в будущем) **никогда** не удаляются.
+- `JARVIS_LOG_TTL_DAYS` — сколько дней хранить записи `messages_log`,
+  завершённые (`done`/`failed`/`cancelled`) `jobs` и завершённые
+  `agent_triggers`. Дефолт `30`. `0`, `none`, `off`, `false`, `no` —
+  отключают авто-cleanup. `pending` jobs/triggers (включая scheduled jobs с
+  `not_before` в будущем) **никогда** не удаляются.
 - `JARVIS_JOBS_CONCURRENCY` — сколько делегированных Менеджером задач
   выполняется параллельно. Дефолт `5`, минимум `1`. Задачи разных топиков идут
   одновременно; внутри одного топика — строго по очереди (per-topic лок). При
   `1` поведение как раньше (одна задача за раз).
+- `JARVIS_AGENT_TRIGGERS_CONCURRENCY` — сколько внешних non-job триггеров
+  (`agent_triggers`, сейчас mxBoard poller) выполнять параллельно. Дефолт `5`,
+  минимум `1`. Триггеры не имеют `job_id` и не участвуют в `manager_interrupt`
+  / heartbeat jobs.
 - `JARVIS_HEARTBEAT_INTERVAL` — частота сканирования in_progress job'ов
   (секунды). Дефолт `300` (5 мин), минимум `30`.
 - `JARVIS_HEARTBEAT_WARN` — после скольких секунд работы job'а слать в
@@ -223,6 +228,17 @@ mxBoard подключается не по выбранному движку, а
 Глобальные user-scope регистрации `mxboard` в `~/.codex/config.toml` и
 `~/.claude.json` должны отсутствовать, иначе identity снова станет зависеть от
 конфига CLI, а не от роли топика.
+
+### mxBoard poller → agent_triggers
+
+`jarvis-mxboard-poller` не должен писать в Jarvis `jobs`: job-обёртка создаёт
+служебные manager-notice на финальном ответе и interrupt, что даёт ложные
+пробуждения Менеджера. Для board-handoff есть отдельная таблица
+`agent_triggers`: poller вставляет `chat_id/thread_id/text/source='mxboard'`,
+а `agent_triggers_worker` запускает обычный LLM turn в топике через тот же
+topic-lock и `/persistent` путь, но без `job_id`, heartbeat и
+`manager_interrupt`. Перед запуском worker логирует входящее в `messages_log`
+как `mxboard_inject`.
 
 ### Вопросы агента пользователю (`ask_user`)
 
