@@ -213,6 +213,8 @@ mxBoard подключается не по выбранному движку, а
   `--profile-v2 <name>`, чтобы Bearer-токен не попадал в process argv. Файл
   создаётся с mode `0600` и удаляется после завершения `codex exec`; для
   persistent app-server — при остановке worker-а.
+  `--profile-v2` — глобальный флаг Codex CLI, поэтому он должен стоять перед
+  subcommand: `codex --profile-v2 <name> exec resume ...`.
 - **opencode**: временный `OPENCODE_CONFIG`, куда добавляется remote
   `mcp.mxboard`; файл удаляется после ответа.
 

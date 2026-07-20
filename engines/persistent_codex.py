@@ -22,6 +22,7 @@ from engines.codex_engine import (
     FILE_MARKER_SYSTEM,
     CodexEngine,
     _is_placeholder,
+    _split_codex_global_flags,
 )
 from engines.process_control import terminate_process_tree
 
@@ -67,23 +68,6 @@ def _mcp_config_overrides(
 
 def _text_input(text: str) -> list[dict]:
     return [{"type": "text", "text": text, "text_elements": []}]
-
-
-def _split_codex_global_flags(flags: list[str]) -> tuple[list[str], list[str]]:
-    """Move Codex global-only flags before the subcommand."""
-    global_flags: list[str] = []
-    command_flags: list[str] = []
-    i = 0
-    while i < len(flags):
-        flag = flags[i]
-        value = flags[i + 1] if i + 1 < len(flags) else None
-        if flag == "--profile-v2" and value is not None:
-            global_flags.extend([flag, value])
-            i += 2
-            continue
-        command_flags.append(flag)
-        i += 1
-    return global_flags, command_flags
 
 
 def _sandbox_policy() -> dict:

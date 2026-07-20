@@ -121,6 +121,23 @@ def _cleanup_paths(paths: list[Path]) -> None:
         cleanup_codex_profile(path)
 
 
+def _split_codex_global_flags(flags: list[str]) -> tuple[list[str], list[str]]:
+    """Move Codex global-only flags before the subcommand."""
+    global_flags: list[str] = []
+    command_flags: list[str] = []
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        value = flags[i + 1] if i + 1 < len(flags) else None
+        if flag == "--profile-v2" and value is not None:
+            global_flags.extend([flag, value])
+            i += 2
+            continue
+        command_flags.append(flag)
+        i += 1
+    return global_flags, command_flags
+
+
 def _redact_cmd(cmd: list[str]) -> list[str]:
     return [re.sub(r"Bearer [^\"'}\s]+", "Bearer ***", part) for part in cmd]
 
@@ -254,7 +271,8 @@ class CodexEngine:
         # Per-topic MCP overrides поверх config.toml. Manager MCP остаётся
         # глобальным, mxBoard и Playwright выбираются на конкретный запуск.
         mcp_flags, mcp_cleanup_paths = _mcp_config_overrides(mcp_playwright, mcp_mxboard_role)
-        shared_flags.extend(mcp_flags)
+        global_flags, command_mcp_flags = _split_codex_global_flags(mcp_flags)
+        shared_flags.extend(command_mcp_flags)
         if is_spawn:
             # Одноразовая параллельная сессия: не хотим, чтобы codex её сохранял
             # и потом мешался в списке recent-sessions.
@@ -267,7 +285,7 @@ class CodexEngine:
             # У resume нет --sandbox и -C/--cd. Sandbox-режим уже покрыт
             # --dangerously-bypass-approvals-and-sandbox, а cwd — через subprocess cwd=.
             cmd = [
-                CODEX_BIN, "exec", "resume",
+                CODEX_BIN, *global_flags, "exec", "resume",
                 *shared_flags,
                 *model_flags,
                 session_id, full_prompt,
@@ -275,7 +293,7 @@ class CodexEngine:
         else:
             # Новая сессия: можем (и хотим) явно задать sandbox и cwd.
             cmd = [
-                CODEX_BIN, "exec",
+                CODEX_BIN, *global_flags, "exec",
                 *shared_flags,
                 *model_flags,
                 "--sandbox", "danger-full-access",

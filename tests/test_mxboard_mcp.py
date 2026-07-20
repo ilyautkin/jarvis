@@ -7,9 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from engines import mxboard_mcp
-from engines.codex_engine import _mcp_config_overrides as codex_mcp_overrides
+from engines.codex_engine import (
+    _mcp_config_overrides as codex_mcp_overrides,
+    _split_codex_global_flags,
+)
 from engines.opencode_engine import _opencode_mcp_config
-from engines.persistent_codex import _split_codex_global_flags
 
 
 CONFIG = {
