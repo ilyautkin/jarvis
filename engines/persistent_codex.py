@@ -22,7 +22,6 @@ from engines.codex_engine import (
     FILE_MARKER_SYSTEM,
     CodexEngine,
     _is_placeholder,
-    _split_codex_global_flags,
 )
 from engines.process_control import terminate_process_tree
 
@@ -55,13 +54,9 @@ def _mcp_config_overrides(
             ])
 
     if mcp_mxboard_role:
-        from engines.mxboard_mcp import create_codex_profile
+        from engines.mxboard_mcp import codex_inline_config_flags
 
-        profile = create_codex_profile(mcp_mxboard_role)
-        if profile is not None:
-            profile_name, profile_path = profile
-            flags.extend(["--profile-v2", profile_name])
-            cleanup_paths.append(profile_path)
+        flags.extend(codex_inline_config_flags(mcp_mxboard_role))
 
     return flags, cleanup_paths
 
@@ -454,14 +449,12 @@ async def start_persistent(
         raise RuntimeError(f"Рабочая папка `{effective_cwd}` не существует.")
 
     mcp_flags, mcp_cleanup_paths = _mcp_config_overrides(mcp_playwright, mcp_mxboard_role)
-    global_mcp_flags, command_mcp_flags = _split_codex_global_flags(mcp_flags)
     cmd = [
         CODEX_BIN,
-        *global_mcp_flags,
         "app-server",
+        *mcp_flags,
         "--listen",
         "stdio://",
-        *command_mcp_flags,
     ]
     logger.info(
         "persistent codex start: key=%s session=%s cwd=%s model=%s",

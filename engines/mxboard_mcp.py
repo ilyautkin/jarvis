@@ -194,6 +194,24 @@ def create_codex_profile(role: str) -> tuple[str, Path] | None:
     return profile_name, path
 
 
+def codex_inline_config_flags(role: str) -> list[str]:
+    """Return Codex ``-c`` flags for commands that cannot use profile-v2."""
+    spec = mxboard_role_spec(role)
+    if spec is None:
+        return []
+
+    table = f"mcp_servers.{spec['name']}"
+    header_items = ", ".join(
+        f"{key} = {json.dumps(str(value), ensure_ascii=False)}"
+        for key, value in spec["headers"].items()
+    )
+    return [
+        "-c", f"{table}.url={json.dumps(spec['url'], ensure_ascii=False)}",
+        "-c", f"{table}.enabled=true",
+        "-c", f"{table}.http_headers={{ {header_items} }}",
+    ]
+
+
 def cleanup_codex_profile(path: Path | None) -> None:
     if path is None:
         return

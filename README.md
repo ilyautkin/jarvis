@@ -209,12 +209,14 @@ mxBoard подключается не по выбранному движку, а
 Инъекция по движкам:
 
 - **claude**: `--mcp-config` с remote HTTP server и Bearer header.
-- **codex**: временный `$CODEX_HOME/jarvis-mxboard-*.config.toml` +
-  `--profile-v2 <name>`, чтобы Bearer-токен не попадал в process argv. Файл
-  создаётся с mode `0600` и удаляется после завершения `codex exec`; для
-  persistent app-server — при остановке worker-а.
+- **codex**: обычный `codex exec` использует временный
+  `$CODEX_HOME/jarvis-mxboard-*.config.toml` + `--profile-v2 <name>`, чтобы
+  Bearer-токен не попадал в process argv. Файл создаётся с mode `0600` и
+  удаляется после завершения `codex exec`.
   `--profile-v2` — глобальный флаг Codex CLI, поэтому он должен стоять перед
-  subcommand: `codex --profile-v2 <name> exec resume ...`.
+  subcommand: `codex --profile-v2 <name> exec resume ...`. Persistent
+  `codex app-server` не поддерживает `--profile-v2`, поэтому mxBoard MCP для
+  него передаётся через `-c mcp_servers.mxboard.*`.
 - **opencode**: временный `OPENCODE_CONFIG`, куда добавляется remote
   `mcp.mxboard`; файл удаляется после ответа.
 
@@ -275,9 +277,10 @@ stdio://` отвечает на `initialize`, создаёт thread через `
 `inProgress` turn через `turn/start` и принимает `turn/steer` во время активного
 turn.
 
-Playwright MCP в persistent Codex подключается теми же `-c
+Playwright MCP в persistent Codex подключается через `-c
 mcp_servers.playwright.*` overrides при старте app-server; mxBoard MCP — через
-временный `--profile-v2`. Роль mxBoard и флаг `/browser` нужно выставить до
+`-c mcp_servers.mxboard.*`, потому что `app-server` не принимает
+`--profile-v2`. Роль mxBoard и флаг `/browser` нужно выставить до
 первого persistent-сообщения в топике: уже запущенный живой процесс не
 перечитывает MCP-конфиг до перезапуска worker-а (`/stop`, `/new`, `/reset`,
 `/engine`, `/persistent off/on` или idle reaper).

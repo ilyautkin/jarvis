@@ -12,6 +12,7 @@ from engines.codex_engine import (
     _split_codex_global_flags,
 )
 from engines.opencode_engine import _opencode_mcp_config
+from engines.persistent_codex import _mcp_config_overrides as persistent_codex_mcp_overrides
 
 
 CONFIG = {
@@ -116,6 +117,19 @@ class MxBoardMcpTest(unittest.TestCase):
 
         self.assertEqual(global_flags, ["--profile-v2", "jarvis-mxboard-test"])
         self.assertEqual(command_flags, ["-c", "mcp_servers.playwright.enabled=true"])
+
+    def test_persistent_codex_uses_inline_config_not_profile_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._config_file(tmp)
+            with patch.object(mxboard_mcp, "DEFAULT_CONFIG", path):
+                flags, cleanup_paths = persistent_codex_mcp_overrides(False, "manager")
+
+        joined = "\n".join(flags)
+        self.assertNotIn("--profile-v2", flags)
+        self.assertEqual(cleanup_paths, [])
+        self.assertIn("mcp_servers.mxboard.url", joined)
+        self.assertIn("mcp_servers.mxboard.http_headers", joined)
+        self.assertIn("manager-token", joined)
 
 
 if __name__ == "__main__":
