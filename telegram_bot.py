@@ -1065,6 +1065,15 @@ def resolve_manager_topic() -> tuple[int, int] | None:
     return None
 
 
+def resolve_mxboard_role_for_topic(key: tuple[int, int]) -> str:
+    """mxBoard MCP identity for a Jarvis topic.
+
+    The selected LLM engine is irrelevant here: the Manager topic acts in
+    mxBoard as ai-manager, every execution/project topic acts as ai-agent.
+    """
+    return "manager" if resolve_manager_topic() == key else "agent"
+
+
 def save_message_context(chat_id: int, message_id: int, ctx: dict) -> None:
     with _db() as conn:
         conn.execute(
@@ -2275,6 +2284,7 @@ async def call_llm_stream(
     # (строка про browser_* только когда Playwright подключён) и передаём в
     # системный канал движка вместо вшивания в каждый prompt.
     mcp_playwright = get_mcp_playwright(*key)
+    mcp_mxboard_role = resolve_mxboard_role_for_topic(key)
     effective_cwd = cwd or CLAUDE_CWD
     system_prefix = build_system_prefix(effective_cwd, mcp_playwright, key=key)
 
@@ -2289,6 +2299,7 @@ async def call_llm_stream(
         spawn_id=spawn_id,
         system_prefix=system_prefix,
         mcp_playwright=mcp_playwright,
+        mcp_mxboard_role=mcp_mxboard_role,
     )
     # Recovery: иногда opencode/codex на resume могут вернуть rc=0, но пустой
     # текст. Для постоянной сессии делаем один автоповтор в новой сессии.
@@ -2315,6 +2326,7 @@ async def call_llm_stream(
                 spawn_id=spawn_id,
                 system_prefix=system_prefix,
                 mcp_playwright=mcp_playwright,
+                mcp_mxboard_role=mcp_mxboard_role,
             )
             ok, final_text, sid_after, actual_model = ok2, final_text2, sid_after2, actual_model2
             session_id = new_sid
@@ -3598,6 +3610,7 @@ async def _handle_persistent_message(
             pending_summary = await _resolve_pending_summary(key, pending_raw)
 
         mcp_playwright = get_mcp_playwright(*key)
+        mcp_mxboard_role = resolve_mxboard_role_for_topic(key)
         effective_cwd = cwd or CLAUDE_CWD
         system_prefix = build_system_prefix(effective_cwd, mcp_playwright, key=key)
 
@@ -3606,11 +3619,13 @@ async def _handle_persistent_message(
                 worker = await start_persistent_claude(
                     key=key, session_id=session_id, cwd=effective_cwd, model=model,
                     system_prefix=system_prefix, mcp_playwright=mcp_playwright,
+                    mcp_mxboard_role=mcp_mxboard_role,
                 )
             elif engine_name == "codex":
                 worker = await start_persistent_codex(
                     key=key, session_id=session_id, cwd=effective_cwd, model=model,
                     system_prefix=system_prefix, mcp_playwright=mcp_playwright,
+                    mcp_mxboard_role=mcp_mxboard_role,
                 )
                 if worker.session_id and worker.session_id != session_id:
                     update_session_id(key[0], key[1], "codex", worker.session_id)

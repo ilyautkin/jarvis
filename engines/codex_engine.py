@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextvars import ContextVar
@@ -72,31 +73,56 @@ def _is_placeholder(session_id: str) -> bool:
     return session_id.startswith(_PLACEHOLDER_PREFIX)
 
 
-def _playwright_config_overrides(mcp_playwright: bool) -> list[str]:
-    """``-c mcp_servers.<name>.*`` оверрайды для codex, если браузер запрошен.
+def _mcp_config_overrides(
+    mcp_playwright: bool,
+    mcp_mxboard_role: str | None,
+) -> tuple[list[str], list[Path]]:
+    """Per-invocation MCP flags and temporary files.
 
     Значения сериализуем через json.dumps — codex парсит value как TOML/JSON,
-    так что строки получают кавычки, а args — валидный массив. Пустой список,
-    если браузер не нужен или Playwright глобально выключен.
+    так что строки получают кавычки, args — валидный массив, headers — объект.
     ПРИМЕЧАНИЕ: парсинг -c с массивом стоит проверить на конкретной версии
     codex (см. README — фолбэк через ручную регистрацию в config.toml).
     """
-    if not mcp_playwright:
-        return []
-    from engines.playwright_mcp import playwright_command_args, playwright_server_name
+    flags: list[str] = []
+    cleanup_paths: list[Path] = []
 
-    spec = playwright_command_args()
-    if spec is None:
-        logger.warning("mcp_playwright requested but Playwright globally disabled")
-        return []
-    npx, args = spec
-    name = playwright_server_name()
-    table = f"mcp_servers.{name}"
-    return [
-        "-c", f"{table}.command={json.dumps(npx, ensure_ascii=False)}",
-        "-c", f"{table}.args={json.dumps(args, ensure_ascii=False)}",
-        "-c", f"{table}.enabled=true",
-    ]
+    if mcp_playwright:
+        from engines.playwright_mcp import playwright_command_args, playwright_server_name
+
+        spec = playwright_command_args()
+        if spec is None:
+            logger.warning("mcp_playwright requested but Playwright globally disabled")
+        else:
+            npx, args = spec
+            table = f"mcp_servers.{playwright_server_name()}"
+            flags.extend([
+                "-c", f"{table}.command={json.dumps(npx, ensure_ascii=False)}",
+                "-c", f"{table}.args={json.dumps(args, ensure_ascii=False)}",
+                "-c", f"{table}.enabled=true",
+            ])
+
+    if mcp_mxboard_role:
+        from engines.mxboard_mcp import create_codex_profile
+
+        profile = create_codex_profile(mcp_mxboard_role)
+        if profile is not None:
+            profile_name, profile_path = profile
+            flags.extend(["--profile-v2", profile_name])
+            cleanup_paths.append(profile_path)
+
+    return flags, cleanup_paths
+
+
+def _cleanup_paths(paths: list[Path]) -> None:
+    from engines.mxboard_mcp import cleanup_codex_profile
+
+    for path in paths:
+        cleanup_codex_profile(path)
+
+
+def _redact_cmd(cmd: list[str]) -> list[str]:
+    return [re.sub(r"Bearer [^\"'}\s]+", "Bearer ***", part) for part in cmd]
 
 
 def _codex_sessions_root() -> Path:
@@ -189,7 +215,8 @@ class CodexEngine:
         spawn_id: str | None = None,
         system_prefix: str | None = None,
         mcp_playwright: bool = False,
-    ) -> tuple[bool, str, str | None]:
+        mcp_mxboard_role: str | None = None,
+    ) -> tuple[bool, str, str | None, str | None]:
         effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
 
         is_spawn = spawn_id is not None
@@ -224,9 +251,10 @@ class CodexEngine:
             "--skip-git-repo-check",
             "--dangerously-bypass-approvals-and-sandbox",
         ]
-        # Playwright on-demand: -c оверрайды поверх config.toml (Manager MCP
-        # остаётся глобальным в config.toml). Без флага браузер не грузится.
-        shared_flags.extend(_playwright_config_overrides(mcp_playwright))
+        # Per-topic MCP overrides поверх config.toml. Manager MCP остаётся
+        # глобальным, mxBoard и Playwright выбираются на конкретный запуск.
+        mcp_flags, mcp_cleanup_paths = _mcp_config_overrides(mcp_playwright, mcp_mxboard_role)
+        shared_flags.extend(mcp_flags)
         if is_spawn:
             # Одноразовая параллельная сессия: не хотим, чтобы codex её сохранял
             # и потом мешался в списке recent-sessions.
@@ -262,6 +290,7 @@ class CodexEngine:
         )
 
         if effective_cwd and not os.path.isdir(effective_cwd):
+            _cleanup_paths(mcp_cleanup_paths)
             return (
                 False,
                 f"⚠️ Рабочая папка `{effective_cwd}` не существует. "
@@ -279,7 +308,11 @@ class CodexEngine:
                 limit=10 * 1024 * 1024,
             )
         except FileNotFoundError:
+            _cleanup_paths(mcp_cleanup_paths)
             return False, f"`{CODEX_BIN}` не найден в PATH.", session_id, None
+        except Exception:
+            _cleanup_paths(mcp_cleanup_paths)
+            raise
 
         if is_spawn:
             spawn_procs[(key[0], key[1], spawn_id)] = proc
@@ -403,6 +436,7 @@ class CodexEngine:
             await terminate_process_tree(proc)
             raise
         finally:
+            _cleanup_paths(mcp_cleanup_paths)
             await flush_intermediate(force=True)
             if is_spawn:
                 skey = (key[0], key[1], spawn_id)
@@ -423,10 +457,11 @@ class CodexEngine:
         if proc.returncode != 0:
             # Подробный лог, чтобы в следующий раз не гадать, что именно
             # запускали: сама команда, cwd и собранные stream-ошибки.
-            # Секреты в cmd попасть не должны — там нет токенов.
+            # Команду логируем только после санитизации: это страховка на случай
+            # будущих secret-bearing флагов.
             logger.warning(
                 "codex rc=%s cmd=%s cwd=%s stderr=%s stream_errors=%s",
-                proc.returncode, cmd, effective_cwd,
+                proc.returncode, _redact_cmd(cmd), effective_cwd,
                 stderr_text[:500], stream_errors[:3],
             )
             if proc.returncode and proc.returncode < 0:

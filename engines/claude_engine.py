@@ -54,30 +54,42 @@ def _sessions_dir_for(cwd: str) -> Path:
     return Path.home() / ".claude" / "projects" / encoded
 
 
-def _playwright_mcp_flags(mcp_playwright: bool) -> list[str]:
-    """``--mcp-config <inline-json>`` для Playwright, если браузер запрошен.
+def _mcp_config_flags(mcp_playwright: bool, mcp_mxboard_role: str | None) -> list[str]:
+    """``--mcp-config <inline-json>`` для per-invocation MCP-серверов.
 
     Без ``--strict-mcp-config`` — конфиг аддитивен к глобальному Manager MCP.
-    Пустой список, если браузер не нужен или Playwright глобально выключен.
+    Пустой список, если дополнительных серверов нет.
     """
-    if not mcp_playwright:
-        return []
-    from engines.playwright_mcp import playwright_command_args, playwright_server_name
+    servers: dict[str, dict] = {}
 
-    spec = playwright_command_args()
-    if spec is None:
-        logger.warning("mcp_playwright requested but Playwright globally disabled")
-        return []
-    npx, args = spec
-    config = {
-        "mcpServers": {
-            playwright_server_name(): {
+    if mcp_playwright:
+        from engines.playwright_mcp import playwright_command_args, playwright_server_name
+
+        spec = playwright_command_args()
+        if spec is None:
+            logger.warning("mcp_playwright requested but Playwright globally disabled")
+        else:
+            npx, args = spec
+            servers[playwright_server_name()] = {
                 "type": "stdio",
                 "command": npx,
                 "args": args,
             }
-        }
-    }
+
+    if mcp_mxboard_role:
+        from engines.mxboard_mcp import mxboard_role_spec
+
+        spec = mxboard_role_spec(mcp_mxboard_role)
+        if spec is not None:
+            servers[spec["name"]] = {
+                "type": "http",
+                "url": spec["url"],
+                "headers": spec["headers"],
+            }
+
+    if not servers:
+        return []
+    config = {"mcpServers": servers}
     return ["--mcp-config", json.dumps(config, ensure_ascii=False)]
 
 
@@ -240,6 +252,7 @@ async def start_persistent(
     model: str | None,
     system_prefix: str | None,
     mcp_playwright: bool,
+    mcp_mxboard_role: str | None = None,
 ) -> PersistentClaudeWorker:
     """Поднять живой ``claude`` под ``stream-json`` вход/выход. Флаги сессии —
     как в разовом вызове (``--resume``/``--session-id``), но выставляются
@@ -256,7 +269,7 @@ async def start_persistent(
     append_system = APPEND_SYSTEM_PROMPT
     if system_prefix:
         append_system = f"{system_prefix}\n\n{APPEND_SYSTEM_PROMPT}"
-    mcp_flags = _playwright_mcp_flags(mcp_playwright)
+    mcp_flags = _mcp_config_flags(mcp_playwright, mcp_mxboard_role)
 
     cmd = [
         CLAUDE_BIN, "--print",
@@ -391,7 +404,8 @@ class ClaudeEngine:
         spawn_id: str | None = None,
         system_prefix: str | None = None,
         mcp_playwright: bool = False,
-    ) -> tuple[bool, str, str | None]:
+        mcp_mxboard_role: str | None = None,
+    ) -> tuple[bool, str, str | None, str | None]:
         # cwd берётся из аргумента (если None — caller должен подставить default).
         effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
 
@@ -417,9 +431,9 @@ class ClaudeEngine:
         if system_prefix:
             append_system = f"{system_prefix}\n\n{APPEND_SYSTEM_PROMPT}"
 
-        # Playwright — on-demand, инъекция per-invocation через --mcp-config
-        # (аддитивно к глобальному Manager MCP, без --strict-mcp-config).
-        mcp_flags = _playwright_mcp_flags(mcp_playwright)
+        # Per-topic MCP injection via --mcp-config (аддитивно к глобальному
+        # Manager MCP, без --strict-mcp-config).
+        mcp_flags = _mcp_config_flags(mcp_playwright, mcp_mxboard_role)
 
         cmd = [
             CLAUDE_BIN, "--print",

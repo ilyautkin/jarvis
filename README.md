@@ -38,6 +38,9 @@
 - Playwright MCP — **on-demand** для любого движка (`claude`/`codex`/`opencode`):
   включается per-topic командой `/browser on` и инъектируется в CLI на каждый
   запрос, без постоянной глобальной регистрации.
+- mxBoard MCP — **role-based** per-topic: manager-topic подключается как
+  `ai-manager`, все остальные топики как `ai-agent`. Движок (`claude`/`codex`/
+  `opencode`) на личность в mxBoard не влияет.
 - Голосовые не поддерживаются.
 - Whitelist по `user_id` (см. `ALLOWED_USER_IDS`).
 
@@ -111,6 +114,16 @@ claude -p "hello"   # проверка, что авторизация работ
 - `JARVIS_MCP_PYTHON` — путь к Python для запуска MCP-сервера (по умолчанию
   `venv/bin/python` репозитория jarvis).
 - `JARVIS_MCP_SCRIPT` / `JARVIS_MCP_DB` — переопределить пути к серверу/БД.
+- `JARVIS_MXBOARD_MCP` — `1`/`0`, глобальный рубильник mxBoard MCP. `1`
+  (по умолчанию) — Jarvis инъектирует mxBoard MCP на каждый вызов с ролью
+  текущего топика.
+- `JARVIS_MXBOARD_AGENTS_CONFIG` — путь к gitignored JSON с `mcp_url` и токенами
+  ролей. По умолчанию `/home/shevartv/projects/apps/mxboard/config/mxboard-agents.json`.
+- `JARVIS_MXBOARD_MCP_NAME` — имя MCP-сервера в CLI-конфигах (по умолчанию
+  `mxboard`).
+- `JARVIS_MXBOARD_MANAGER_USERNAME` / `JARVIS_MXBOARD_AGENT_USERNAME` — подписи
+  ролей для логов, по умолчанию `ai-manager` / `ai-agent`. На авторизацию влияет
+  токен, а не это имя.
 - `JARVIS_LOG_TTL_DAYS` — сколько дней хранить записи `messages_log` и
   завершённые (`done`/`failed`/`cancelled`) `jobs`. Дефолт `30`. `0`,
   `none`, `off`, `false`, `no` — отключают авто-cleanup. `pending` jobs
@@ -179,6 +192,34 @@ Playwright **не** регистрируется глобально, а инъе
 >
 > claude (основной канал) работает через `--mcp-config` без оговорок.
 
+### mxBoard MCP — роли ai-manager / ai-agent
+
+mxBoard подключается не по выбранному движку, а по роли Telegram-топика:
+`resolve_mxboard_role_for_topic()` сравнивает `(chat_id, thread_id)` с
+`resolve_manager_topic()`. Если это manager-topic, CLI получает токен
+`ai-manager`; любой проектный/исполнительский топик получает токен `ai-agent`.
+
+Источник токенов — gitignored
+`/home/shevartv/projects/apps/mxboard/config/mxboard-agents.json`. Jarvis
+поддерживает переходный формат с `manager` + `executors`: токен агента берётся
+из `agent.token`, если он есть, иначе из executor с username `ai-agent`, иначе из
+первого executor. Это нужно, чтобы переименование MODX-пользователей
+`codex`/`claude-agent` в `ai-manager`/`ai-agent` не ломало уже выпущенные токены.
+
+Инъекция по движкам:
+
+- **claude**: `--mcp-config` с remote HTTP server и Bearer header.
+- **codex**: временный `$CODEX_HOME/jarvis-mxboard-*.config.toml` +
+  `--profile-v2 <name>`, чтобы Bearer-токен не попадал в process argv. Файл
+  создаётся с mode `0600` и удаляется после завершения `codex exec`; для
+  persistent app-server — при остановке worker-а.
+- **opencode**: временный `OPENCODE_CONFIG`, куда добавляется remote
+  `mcp.mxboard`; файл удаляется после ответа.
+
+Глобальные user-scope регистрации `mxboard` в `~/.codex/config.toml` и
+`~/.claude.json` должны отсутствовать, иначе identity снова станет зависеть от
+конфига CLI, а не от роли топика.
+
 ### Вопросы агента пользователю (`ask_user`)
 
 Агент запускается неинтерактивно и перебить его нельзя — но он может сам
@@ -233,10 +274,11 @@ stdio://` отвечает на `initialize`, создаёт thread через `
 turn.
 
 Playwright MCP в persistent Codex подключается теми же `-c
-mcp_servers.playwright.*` overrides при старте app-server. Флаг `/browser`
-нужно включать до первого persistent-сообщения в топике: уже запущенный живой
-процесс не перечитывает MCP-конфиг до перезапуска worker-а (`/stop`, `/new`,
-`/reset`, `/engine`, `/persistent off/on` или idle reaper).
+mcp_servers.playwright.*` overrides при старте app-server; mxBoard MCP — через
+временный `--profile-v2`. Роль mxBoard и флаг `/browser` нужно выставить до
+первого persistent-сообщения в топике: уже запущенный живой процесс не
+перечитывает MCP-конфиг до перезапуска worker-а (`/stop`, `/new`, `/reset`,
+`/engine`, `/persistent off/on` или idle reaper).
 
 ### Что видно из рассуждений агента
 
@@ -333,8 +375,8 @@ Env `CLAUDE_MODELS` / `CODEX_MODELS` / `OPENCODE_MODELS` перекрывают 
 
 ### Как подключить новый движок
 
-Браузер on-demand — часть контракта `Engine.call_stream` (см.
-`engines/__init__.py`). Новый адаптер обязан принять и обработать два
+Per-topic MCP — часть контракта `Engine.call_stream` (см.
+`engines/__init__.py`). Новый адаптер обязан принять и обработать три
 параметра:
 
 - `system_prefix: str | None` — постоянный `[SYSTEM:]`-блок. Положи его в
@@ -346,6 +388,9 @@ Env `CLAUDE_MODELS` / `CODEX_MODELS` / `OPENCODE_MODELS` перекрывают 
   (флаг конфига / оверрайд / временный конфиг через env). Если CLI вообще не
   умеет per-invocation MCP — задокументируй ручную глобальную настройку как
   фолбэк (раздел выше).
+- `mcp_mxboard_role: str | None` — если задано, инъектируй mxBoard MCP с ролью
+  `manager` или `agent` через `mxboard_role_spec()`. Для CLI, где секреты могли
+  бы попасть в argv, используй файл/профиль, а не command-line override.
 
 ### Jarvis Manager MCP (для агента-Менеджера)
 

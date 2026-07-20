@@ -30,28 +30,60 @@ logger = logging.getLogger(__name__)
 INTERMEDIATE_MIN_INTERVAL = 2.0
 
 
-def _playwright_config_overrides(mcp_playwright: bool) -> list[str]:
-    """``-c mcp_servers.<name>.*`` overrides for app-server startup."""
-    if not mcp_playwright:
-        return []
-    from engines.playwright_mcp import playwright_command_args, playwright_server_name
+def _mcp_config_overrides(
+    mcp_playwright: bool,
+    mcp_mxboard_role: str | None,
+) -> tuple[list[str], list[Path]]:
+    """App-server MCP flags and temporary files."""
+    flags: list[str] = []
+    cleanup_paths: list[Path] = []
 
-    spec = playwright_command_args()
-    if spec is None:
-        logger.warning("persistent codex: Playwright requested but globally disabled")
-        return []
-    npx, args = spec
-    name = playwright_server_name()
-    table = f"mcp_servers.{name}"
-    return [
-        "-c", f"{table}.command={json.dumps(npx, ensure_ascii=False)}",
-        "-c", f"{table}.args={json.dumps(args, ensure_ascii=False)}",
-        "-c", f"{table}.enabled=true",
-    ]
+    if mcp_playwright:
+        from engines.playwright_mcp import playwright_command_args, playwright_server_name
+
+        spec = playwright_command_args()
+        if spec is None:
+            logger.warning("persistent codex: Playwright requested but globally disabled")
+        else:
+            npx, args = spec
+            table = f"mcp_servers.{playwright_server_name()}"
+            flags.extend([
+                "-c", f"{table}.command={json.dumps(npx, ensure_ascii=False)}",
+                "-c", f"{table}.args={json.dumps(args, ensure_ascii=False)}",
+                "-c", f"{table}.enabled=true",
+            ])
+
+    if mcp_mxboard_role:
+        from engines.mxboard_mcp import create_codex_profile
+
+        profile = create_codex_profile(mcp_mxboard_role)
+        if profile is not None:
+            profile_name, profile_path = profile
+            flags.extend(["--profile-v2", profile_name])
+            cleanup_paths.append(profile_path)
+
+    return flags, cleanup_paths
 
 
 def _text_input(text: str) -> list[dict]:
     return [{"type": "text", "text": text, "text_elements": []}]
+
+
+def _split_codex_global_flags(flags: list[str]) -> tuple[list[str], list[str]]:
+    """Move Codex global-only flags before the subcommand."""
+    global_flags: list[str] = []
+    command_flags: list[str] = []
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        value = flags[i + 1] if i + 1 < len(flags) else None
+        if flag == "--profile-v2" and value is not None:
+            global_flags.extend([flag, value])
+            i += 2
+            continue
+        command_flags.append(flag)
+        i += 1
+    return global_flags, command_flags
 
 
 def _sandbox_policy() -> dict:
@@ -68,6 +100,7 @@ class PersistentCodexWorker:
         session_id: str,
         cwd: str,
         model: str | None,
+        cleanup_paths: list[Path] | None = None,
     ):
         self.key = key
         self.proc = proc
@@ -90,6 +123,7 @@ class PersistentCodexWorker:
         self._active_turn_id: str | None = None
         self._final_text = ""
         self._stderr_tail: deque[str] = deque(maxlen=80)
+        self._cleanup_paths = cleanup_paths or []
 
     async def initialize_and_open_thread(
         self,
@@ -261,6 +295,7 @@ class PersistentCodexWorker:
                 self._resolve(False, f"Codex app-server reader crashed: {exc}")
         finally:
             self.dead = True
+            self._cleanup_profiles()
             await self._flush(force=True)
             err = await self.read_stderr_tail()
             for fut in list(self._pending_requests.values()):
@@ -377,6 +412,16 @@ class PersistentCodexWorker:
     async def read_stderr_tail(self) -> str:
         return "\n".join(self._stderr_tail)[-2000:]
 
+    def _cleanup_profiles(self) -> None:
+        if not self._cleanup_paths:
+            return
+        from engines.mxboard_mcp import cleanup_codex_profile
+
+        paths = self._cleanup_paths
+        self._cleanup_paths = []
+        for path in paths:
+            cleanup_codex_profile(path)
+
 
 def _extract_thread_id(result: dict) -> str | None:
     for obj in (result, result.get("thread")):
@@ -417,18 +462,22 @@ async def start_persistent(
     model: str | None,
     system_prefix: str | None,
     mcp_playwright: bool,
+    mcp_mxboard_role: str | None = None,
 ) -> PersistentCodexWorker:
     """Start app-server and open/resume a Codex thread."""
     effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
     if not os.path.isdir(effective_cwd):
         raise RuntimeError(f"Рабочая папка `{effective_cwd}` не существует.")
 
+    mcp_flags, mcp_cleanup_paths = _mcp_config_overrides(mcp_playwright, mcp_mxboard_role)
+    global_mcp_flags, command_mcp_flags = _split_codex_global_flags(mcp_flags)
     cmd = [
         CODEX_BIN,
+        *global_mcp_flags,
         "app-server",
         "--listen",
         "stdio://",
-        *_playwright_config_overrides(mcp_playwright),
+        *command_mcp_flags,
     ]
     logger.info(
         "persistent codex start: key=%s session=%s cwd=%s model=%s",
@@ -437,16 +486,23 @@ async def start_persistent(
         effective_cwd,
         model,
     )
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=effective_cwd,
-        start_new_session=True,
-        limit=10 * 1024 * 1024,
-    )
-    worker = PersistentCodexWorker(key, proc, session_id, effective_cwd, model)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=effective_cwd,
+            start_new_session=True,
+            limit=10 * 1024 * 1024,
+        )
+    except Exception:
+        from engines.mxboard_mcp import cleanup_codex_profile
+
+        for path in mcp_cleanup_paths:
+            cleanup_codex_profile(path)
+        raise
+    worker = PersistentCodexWorker(key, proc, session_id, effective_cwd, model, mcp_cleanup_paths)
     worker.reader_task = asyncio.create_task(worker._read_loop())
     worker.stderr_task = asyncio.create_task(worker._read_stderr_loop())
     try:
@@ -457,6 +513,7 @@ async def start_persistent(
             worker.reader_task.cancel()
         if worker.stderr_task:
             worker.stderr_task.cancel()
+        worker._cleanup_profiles()
         await terminate_process_tree(proc)
         raise
     return worker
