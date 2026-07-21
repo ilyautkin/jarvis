@@ -339,17 +339,14 @@ class PersistentCodexWorker:
             return
 
         if method == "item/agentMessage/delta":
-            delta = (params.get("delta") or "").strip()
-            if delta:
-                self._buffer.append(delta[:800])
-                await self._flush()
+            # Delta events are token/subword fragments. Publishing them directly
+            # makes Telegram journal lines like "Од\nобр\nение". The completed
+            # agentMessage item below carries the assembled text.
             return
 
         if method in {"item/reasoning/summaryTextDelta", "item/reasoning/textDelta"}:
-            delta = (params.get("delta") or "").strip()
-            if delta:
-                self._buffer.append(f"💭 {delta[:800]}")
-                await self._flush()
+            # Same as agentMessage deltas: wait for item/completed, where Codex
+            # sends reasoning content as assembled summary/content chunks.
             return
 
         if method == "turn/completed":
