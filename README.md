@@ -351,6 +351,13 @@ mcp_servers.playwright.*` overrides при старте app-server; mxBoard MCP 
 
 - `/close` — закрыть сеанс сейчас.
 - `/new`, `/reset` — закрыть и сразу открыть новый.
+- `manager_close_session` (MCP) — то же самое из другого топика: Менеджер
+  закрывает чужой сеанс, не заходя в него. MCP-сервер — отдельный процесс и
+  не видит `active_procs` / `persistent_workers` бота, поэтому он закрывает
+  сеанс в БД и ставит `sessions.close_requested`; `close_requests_worker`
+  бота раз в 2 с добивает процессы топика и пишет туда нотис
+  (`kind='session_closed'`). Без этого шага топик с `/persistent on`
+  продолжил бы отвечать из живого процесса со старым контекстом.
 - `/session` — состояние сеанса: сколько простаивает, когда закроется.
 - `/tokens` — оценка размера контекста текущей сессии.
 - `scripts/session_tokens.py --chat-id <id> --thread-id <id>` — та же
@@ -429,14 +436,19 @@ Per-topic MCP — часть контракта `Engine.call_stream` (см.
 - `manager_set_browser` — включить/выключить браузер (Playwright MCP) для
   топика (`thread_id`, `enabled`). Аналог команды `/browser`. Применяется со
   следующего сообщения/джоба, контекст сессии сохраняется.
+- `manager_close_session` — закрыть сеанс топика (`thread_id`,
+  `interrupt_active=true`). Аналог команды `/close`: контекст движка
+  сбрасывается, топик (cwd/engine/model/флаги) остаётся. По умолчанию сначала
+  прерывает активные job'ы топика, как `manager_interrupt`. Возвращает
+  `was_open` и `interrupted_jobs`.
 
 (Это не полный список — есть и write-tools: `manager_send`, `manager_set_engine`,
 `manager_create_topic` и др. См. декораторы `@mcp.tool` в `scripts/jarvis_mcp_server.py`.)
 
 Точки записи в `messages_log`: входящие пользовательские реплики
 (`direction='in'`, `kind='user_text'`) и финальные ответы бота
-(`direction='out'`, `kind='bot_reply'` / `'spawn_reply'`). Промежуточные
-tool-use'ы не логируются — они шумные.
+(`direction='out'`, `kind='bot_reply'` / `'spawn_reply'` /
+`'session_closed'`). Промежуточные tool-use'ы не логируются — они шумные.
 
 Проверка:
 

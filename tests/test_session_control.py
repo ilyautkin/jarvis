@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from engines.session_usage import aggregate_claude_usage
 from telegram_bot import (
@@ -128,6 +132,156 @@ class ClaudeUsageAggregationTest(unittest.TestCase):
         self.assertEqual(totals.cache_write_tokens, 33)
         self.assertEqual(totals.cache_read_tokens, 44)
         self.assertIn("deduplicated 1", usage.note or "")
+
+
+def _load_mcp_server():
+    """scripts/ не пакет — грузим MCP-сервер по пути."""
+    path = Path(__file__).resolve().parent.parent / "scripts" / "jarvis_mcp_server.py"
+    spec = importlib.util.spec_from_file_location("jarvis_mcp_server_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeChat:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, dict]] = []
+
+    async def send_message(self, text: str, **kwargs):
+        self.sent.append((text, kwargs))
+        return SimpleNamespace(message_id=4242)
+
+
+class _FakeApp:
+    def __init__(self, chat: _FakeChat) -> None:
+        self.chat = chat
+        self.bot = SimpleNamespace(get_chat=self._get_chat)
+
+    async def _get_chat(self, chat_id: int):
+        return self.chat
+
+
+class ManagerCloseSessionTest(unittest.TestCase):
+    """manager_close_session (MCP) → close_requests_worker (бот): закрытие
+    сеанса чужого топика через БД, потому что процессы топика видит только бот."""
+
+    CHAT_ID = -100500
+    THREAD_ID = 77
+
+    def _seed(self, db_path: str) -> None:
+        now = datetime.utcnow().isoformat()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO sessions(chat_id, thread_id, session_id, cwd, engine, "
+                "model, updated_at, last_activity_at, session_started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (self.CHAT_ID, self.THREAD_ID, "sid-1", "/tmp/topic", "claude",
+                 None, now, now, now),
+            )
+            conn.execute(
+                "INSERT INTO jobs(chat_id, thread_id, text, status, created_at) "
+                "VALUES (?, ?, ?, 'in_progress', ?)",
+                (self.CHAT_ID, self.THREAD_ID, "долгая задача", now),
+            )
+
+    def test_close_request_flows_from_mcp_to_bot(self) -> None:
+        import telegram_bot
+
+        mcp_server = _load_mcp_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "bot_state.db")
+            with patch.object(telegram_bot, "DB_PATH", db_path):
+                telegram_bot.init_db()
+                self._seed(db_path)
+
+                mcp_server._DB_PATH = Path(db_path)
+                result = mcp_server.manager_close_session(
+                    thread_id=self.THREAD_ID, chat_id=self.CHAT_ID,
+                )
+
+                # MCP: сеанс закрыт сразу, активный job помечен на прерывание,
+                # для бота выставлен close_requested.
+                self.assertTrue(result["was_open"])
+                self.assertEqual(len(result["interrupted_jobs"]), 1)
+                self.assertEqual(result["engine"], "claude")
+                with sqlite3.connect(db_path) as conn:
+                    row = conn.execute(
+                        "SELECT last_activity_at, close_requested FROM sessions "
+                        "WHERE chat_id = ? AND thread_id = ?",
+                        (self.CHAT_ID, self.THREAD_ID),
+                    ).fetchone()
+                    cancel = conn.execute(
+                        "SELECT cancel_requested FROM jobs"
+                    ).fetchone()[0]
+                self.assertIsNone(row[0])
+                self.assertIsNotNone(row[1])
+                self.assertIsNotNone(cancel)
+
+                # Бот: добивает процессы топика, гасит флаг, пишет в топик.
+                chat = _FakeChat()
+                app = _FakeApp(chat)
+                key = (self.CHAT_ID, self.THREAD_ID)
+                with patch.object(
+                    telegram_bot, "_kill_persistent_worker", new=AsyncMock(return_value=True)
+                ) as kill:
+                    asyncio.run(telegram_bot._apply_close_request(app, key))
+                kill.assert_awaited_once()
+                self.assertEqual(kill.await_args.args[0], key)
+
+                with sqlite3.connect(db_path) as conn:
+                    flag = conn.execute(
+                        "SELECT close_requested FROM sessions "
+                        "WHERE chat_id = ? AND thread_id = ?",
+                        (self.CHAT_ID, self.THREAD_ID),
+                    ).fetchone()[0]
+                    logged = conn.execute(
+                        "SELECT kind, telegram_message_id FROM messages_log"
+                    ).fetchone()
+                self.assertIsNone(flag)
+                self.assertEqual(len(chat.sent), 1)
+                self.assertIn("Сеанс закрыт Менеджером", chat.sent[0][0])
+                self.assertEqual(chat.sent[0][1]["message_thread_id"], self.THREAD_ID)
+                self.assertEqual(logged, ("session_closed", 4242))
+
+                # Повтор на закрытом сеансе идемпотентен (job к этому моменту
+                # уже завершён — прерывать нечего).
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute("UPDATE jobs SET status = 'done'")
+                repeat = mcp_server.manager_close_session(
+                    thread_id=self.THREAD_ID, chat_id=self.CHAT_ID,
+                )
+                self.assertFalse(repeat["was_open"])
+                self.assertEqual(repeat["interrupted_jobs"], [])
+
+    def test_unknown_topic_is_rejected(self) -> None:
+        import telegram_bot
+
+        mcp_server = _load_mcp_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "bot_state.db")
+            with patch.object(telegram_bot, "DB_PATH", db_path):
+                telegram_bot.init_db()
+            mcp_server._DB_PATH = Path(db_path)
+            with self.assertRaises(RuntimeError):
+                mcp_server.manager_close_session(thread_id=1, chat_id=self.CHAT_ID)
+
+    def test_mcp_adds_close_requested_column_on_old_db(self) -> None:
+        """MCP-сервер может подняться раньше бота новой версии — колонку
+        заводит сам, иначе инструмент падал бы на 'no such column'."""
+        mcp_server = _load_mcp_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "old.db")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE sessions (chat_id INTEGER NOT NULL, "
+                    "thread_id INTEGER NOT NULL, session_id TEXT NOT NULL)"
+                )
+                mcp_server._ensure_close_requested_column(conn)
+                cols = [r[1] for r in conn.execute(
+                    "PRAGMA table_info(sessions)"
+                ).fetchall()]
+        self.assertIn("close_requested", cols)
 
 
 if __name__ == "__main__":

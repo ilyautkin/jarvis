@@ -370,6 +370,18 @@ def init_db() -> None:
                 conn.execute(
                     "ALTER TABLE sessions ADD COLUMN session_started_at TEXT"
                 )
+            # Idempotent миграция: close_requested — флаг для manager_close_session.
+            # MCP-сервер живёт отдельным процессом и не видит active_procs /
+            # persistent_workers бота, поэтому «убей живые процессы топика»
+            # передаётся через БД: MCP ставит timestamp, close_requests_worker
+            # раз в 2с его читает и доделывает то, что умеет только бот.
+            # NULL = не запрошено (тот же приём, что cancel_requested у jobs).
+            cols_now = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+            if cols_now and "close_requested" not in cols_now:
+                logger.info("adding 'close_requested' column to sessions")
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN close_requested TEXT"
+                )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -1310,6 +1322,17 @@ def close_session(chat_id: int, thread_id: int) -> bool:
     return True
 
 
+def clear_close_request(chat_id: int, thread_id: int) -> None:
+    """Погасить флаг close_requested — закрытие, запрошенное Менеджером через
+    MCP (manager_close_session), доведено ботом до конца."""
+    with _db() as conn:
+        conn.execute(
+            "UPDATE sessions SET close_requested = NULL "
+            "WHERE chat_id = ? AND thread_id = ?",
+            (chat_id, thread_id),
+        )
+
+
 def _session_is_stale(last_activity_at: str | None) -> bool:
     """Протух ли сеанс: закрыт (NULL) или простаивал дольше порога."""
     if not last_activity_at:
@@ -1937,6 +1960,72 @@ async def persistent_reaper(app: Application) -> None:
             raise
         except Exception:
             logger.exception("persistent_reaper loop crashed; continuing")
+
+
+# Закрытия сеансов, запрошенные Менеджером через MCP. Опрос частый (как у
+# interrupt-вотчера): между запросом и смертью живого процесса топик ещё
+# отвечает старым контекстом, поэтому окно держим коротким.
+CLOSE_REQUEST_POLL_SECONDS = 2.0
+
+
+async def _apply_close_request(app: Application, key: tuple[int, int]) -> None:
+    """Доделать закрытие сеанса, помеченное Менеджером: убить процессы топика
+    (их видит только бот), закрыть сеанс, погасить флаг и сказать об этом в
+    топик. Порядок и эффект — те же, что у /close."""
+    proc = active_procs.get(key)
+    if proc is not None:
+        await terminate_process_tree(proc)
+        active_procs.pop(key, None)
+        logger.info("manager close: killed active proc for key=%s", key)
+    await _kill_persistent_worker(key, "сеанс закрыт Менеджером")
+
+    close_session(*key)
+    clear_close_request(*key)
+
+    _sid, cwd, engine_name = get_session(*key)
+    logger.info("session closed by manager: key=%s engine=%s", key, engine_name)
+
+    notice = (
+        "🚪 Сеанс закрыт Менеджером. Контекст сброшен — следующее сообщение "
+        "начнёт новый.\n"
+        f"Топик сохранён: {engine_name}, {cwd or CLAUDE_CWD}"
+    )
+    try:
+        chat = await app.bot.get_chat(key[0])
+        sent = await send_to_topic(chat, key[1], notice)
+        log_message(key[0], key[1], "out", "session_closed", notice,
+                    sent.message_id if sent is not None else None)
+    except Exception:
+        # Сеанс уже закрыт — нотис вторичен, повторять цикл из-за него нельзя.
+        logger.exception("manager close: notice failed key=%s", key)
+
+
+async def close_requests_worker(app: Application) -> None:
+    """Исполняет закрытия сеансов, запрошенные Менеджером через MCP
+    (manager_close_session).
+
+    MCP-сервер — отдельный процесс: он умеет только пометить строку в
+    sessions. Убить активный subprocess и живой процесс /persistent может
+    лишь бот — они лежат в его памяти (active_procs / persistent_workers), а
+    persistent-путь берёт воркера ДО ensure_active_session, т.е. без этого
+    добивания топик продолжил бы отвечать из старого контекста."""
+    logger.info("close_requests_worker started (poll=%.1fs)",
+                CLOSE_REQUEST_POLL_SECONDS)
+    while True:
+        try:
+            await asyncio.sleep(CLOSE_REQUEST_POLL_SECONDS)
+            with _db() as conn:
+                rows = conn.execute(
+                    "SELECT chat_id, thread_id FROM sessions "
+                    "WHERE close_requested IS NOT NULL"
+                ).fetchall()
+            for chat_id, thread_id in rows:
+                await _apply_close_request(app, (chat_id, thread_id))
+        except asyncio.CancelledError:
+            logger.info("close_requests_worker cancelled")
+            raise
+        except Exception:
+            logger.exception("close_requests_worker loop crashed; continuing")
 
 
 def _lock_for(key: tuple[int, int]) -> asyncio.Lock:
@@ -4732,6 +4821,11 @@ async def _post_init(application: Application) -> None:
     # /persistent: убивает простаивающие живые процессы claude.
     persistent_reaper_task = asyncio.create_task(persistent_reaper(application))
     application.bot_data["persistent_reaper_task"] = persistent_reaper_task
+
+    # Закрытия сеансов, запрошенные Менеджером через manager_close_session:
+    # MCP помечает строку в sessions, добивает процессы топика бот.
+    close_requests_task = asyncio.create_task(close_requests_worker(application))
+    application.bot_data["close_requests_worker_task"] = close_requests_task
 
     # Health: следит за долгими in_progress jobs, шлёт Менеджеру нотисы.
     # Параметры в env JARVIS_HEARTBEAT_INTERVAL/WARN/FAIL (300/900/3600с).

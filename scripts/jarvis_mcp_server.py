@@ -138,6 +138,19 @@ def _telegram_api(method: str, params: dict[str, Any]) -> dict[str, Any]:
     return data["result"]
 
 
+def _ensure_close_requested_column(conn: sqlite3.Connection) -> None:
+    """Idempotent-миграция sessions.close_requested на стороне MCP.
+
+    Ту же колонку заводит init_db бота, но порядок запуска не гарантирован:
+    MCP-сервер может подняться на БД, которую бот ещё не открывал новой
+    версией. ALTER здесь — nullable-колонка, для бота безвредна.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+    if cols and "close_requested" not in cols:
+        logger.info("adding 'close_requested' column to sessions (mcp side)")
+        conn.execute("ALTER TABLE sessions ADD COLUMN close_requested TEXT")
+
+
 def _new_session_id(engine: str) -> str:
     """Match engine adapters: claude uses raw UUID, codex/opencode placeholders."""
     if engine in _PLACEHOLDER_ENGINES:
@@ -1013,6 +1026,99 @@ def manager_interrupt(
             "Bot watcher will terminate the subprocess within ~2s."
             if interrupted_jobs
             else "No in_progress jobs in this topic right now."
+        ),
+    }
+
+
+@mcp.tool(
+    name="manager_close_session",
+    description=(
+        "Закрывает сеанс в топике — программный аналог команды /close. "
+        "Сеанс = окно терминала: закрытие сбрасывает контекст движка, но "
+        "сам топик (cwd, engine, model, флаги браузера/persistent) "
+        "сохраняется, и следующее сообщение / manager_send откроет новый "
+        "сеанс с чистой историей. Используй, когда контекст топика "
+        "распух или протух: агент тянет старую задачу, путается в "
+        "отменённых договорённостях, ест токены на ненужной истории. "
+        "По умолчанию (interrupt_active=True) сначала прерывает активные "
+        "job'ы топика, как manager_interrupt — иначе идущая задача "
+        "продолжала бы писать в закрытый сеанс. Живой процесс "
+        "/persistent и запущенный subprocess убивает бот: он видит "
+        "флаг close_requested в течение ~2с, после чего пишет в топик, "
+        "что сеанс закрыт. Возвращает was_open (был ли сеанс открыт) и "
+        "interrupted_jobs."
+    ),
+)
+def manager_close_session(
+    thread_id: int,
+    chat_id: int | None = None,
+    interrupt_active: bool = True,
+) -> dict[str, Any]:
+    """Close a topic's session: reset engine context, keep the topic."""
+    target_chat_id = chat_id if chat_id is not None else _default_chat_id()
+    now = datetime.utcnow().isoformat()
+
+    with _connect() as conn:
+        _ensure_close_requested_column(conn)
+        row = conn.execute(
+            "SELECT cwd, engine, model, topic_title, last_activity_at "
+            "FROM sessions WHERE chat_id = ? AND thread_id = ?",
+            (target_chat_id, thread_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"topic chat_id={target_chat_id} thread_id={thread_id} is not "
+                "tracked — nothing to close (use manager_topics to list)."
+            )
+
+        interrupted_jobs: list[int] = []
+        if interrupt_active:
+            jobs = conn.execute(
+                "UPDATE jobs SET cancel_requested = ? "
+                "WHERE chat_id = ? AND thread_id = ? AND status = 'in_progress' "
+                "RETURNING id",
+                (now, target_chat_id, thread_id),
+            ).fetchall()
+            interrupted_jobs = [r[0] for r in jobs]
+
+        # last_activity_at = NULL — это и есть «сеанс закрыт» (session_id
+        # NOT NULL, его обнулить нельзя; новый создастся лениво при следующем
+        # сообщении). close_requested — сигнал боту добить процессы топика.
+        conn.execute(
+            "UPDATE sessions SET last_activity_at = NULL, close_requested = ?, "
+            "updated_at = ? WHERE chat_id = ? AND thread_id = ?",
+            (now, now, target_chat_id, thread_id),
+        )
+
+    was_open = row["last_activity_at"] is not None
+    logger.info(
+        "manager_close_session chat=%s thread=%s was_open=%s jobs=%s",
+        target_chat_id, thread_id, was_open, interrupted_jobs,
+    )
+    return {
+        "chat_id": target_chat_id,
+        "thread_id": thread_id,
+        "title": row["topic_title"],
+        "cwd": row["cwd"],
+        "engine": row["engine"],
+        "model": row["model"],
+        "was_open": was_open,
+        "interrupted_jobs": interrupted_jobs,
+        "requested_at": now,
+        "message": (
+            (
+                "Session closed. "
+                if was_open
+                else "Session was already closed; request registered anyway. "
+            )
+            + (
+                f"Interrupted {len(interrupted_jobs)} in_progress job(s). "
+                if interrupted_jobs
+                else ""
+            )
+            + "The bot kills the topic's live processes within ~2s and posts a "
+              "notice there. Topic settings (cwd/engine/model) are kept; the "
+              "next message starts a fresh session."
         ),
     }
 
