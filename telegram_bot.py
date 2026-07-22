@@ -514,10 +514,22 @@ def init_db() -> None:
                 claimed_at TEXT,
                 finished_at TEXT,
                 error TEXT,
-                result_message_id INTEGER
+                result_message_id INTEGER,
+                role TEXT
             )
             """
         )
+        # Idempotent миграция: role — кому адресован триггер ('executor' |
+        # 'manager'). Пишет поллер; читает ask_user в MCP-сервере, чтобы
+        # запретить вопросы в чат исполнителю, работающему по задаче доски.
+        # NULL = роль неизвестна (старая запись / поллер ещё не обновлён) —
+        # такие не блокируем.
+        cols_now = [
+            r[1] for r in conn.execute("PRAGMA table_info(agent_triggers)").fetchall()
+        ]
+        if cols_now and "role" not in cols_now:
+            logger.info("adding 'role' column to agent_triggers")
+            conn.execute("ALTER TABLE agent_triggers ADD COLUMN role TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_triggers_pending "
             "ON agent_triggers(status, created_at)"

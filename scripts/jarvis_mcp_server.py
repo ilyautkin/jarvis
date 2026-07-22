@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -1237,6 +1238,36 @@ async def manager_wait_reply(
         await asyncio.sleep(poll_interval)
 
 
+_TASK_TAG_RE = re.compile(r"#[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _mxboard_executor_task(chat_id: int, thread_id: int) -> str | None:
+    """Задача доски, по которой топик прямо сейчас работает как ИСПОЛНИТЕЛЬ.
+
+    Возвращает тег задачи ('#123', или '#?' если тег не распознан) — значит
+    текущий ход поднят поллером mxBoard и адресован исполнителю. None —
+    обычный ход (сообщение человека, триггер Менеджеру, роль неизвестна).
+
+    Роль пишет поллер в agent_triggers.role. NULL/нет колонки → None:
+    правка не должна включаться вслепую на неперезапущенном стеке.
+    """
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT text FROM agent_triggers WHERE chat_id = ? AND thread_id = ? "
+                "AND status = 'in_progress' AND source = 'mxboard' AND role = 'executor' "
+                "ORDER BY id DESC LIMIT 1",
+                (chat_id, thread_id),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        logger.warning("agent_triggers.role is missing — mxboard ask_user guard is off")
+        return None
+    if row is None:
+        return None
+    match = _TASK_TAG_RE.search(row["text"] or "")
+    return match.group(0) if match else "#?"
+
+
 def _ask_keyboard(ask_id: int, options: list[str]) -> dict[str, Any]:
     """Inline-клавиатура вариантов. В callback_data идёт ИНДЕКС, а не текст:
     Telegram ограничивает callback_data 64 байтами."""
@@ -1266,7 +1297,11 @@ def _ask_keyboard(ask_id: int, options: list[str]) -> dict[str, Any]:
         "treat it as 'no answer' and stop, unless you passed an explicit "
         "`default`.\n\n"
         "Do not use this for questions you can answer yourself by reading the "
-        "code, running a command, or checking git — he is not a lookup service."
+        "code, running a command, or checking git — he is not a lookup service.\n\n"
+        "NOT available while you work on an mxBoard task as its assignee: such "
+        "a call is rejected with {status: 'blocked'}. There the whole dialogue "
+        "belongs in the card — post your question as a task comment and end "
+        "your turn; his reply wakes you again."
     ),
 )
 async def ask_user(
@@ -1287,6 +1322,26 @@ async def ask_user(
     poll_interval = min(max(poll_interval, 1.0), 30.0)
     options = [str(o).strip() for o in (options or []) if str(o).strip()][:8]
     target_chat_id = chat_id if chat_id is not None else _default_chat_id()
+
+    # Работаешь по задаче доски как исполнитель — чат не твой канал: ответ в
+    # нём осел бы мимо карточки. Отказ вместо вопроса, ничего не отправляем.
+    task_tag = _mxboard_executor_task(target_chat_id, thread_id)
+    if task_tag is not None:
+        logger.info(
+            "ask_user blocked for mxboard task %s (thread=%s)", task_tag, thread_id,
+        )
+        return {
+            "status": "blocked",
+            "task": task_tag,
+            "error": (
+                f"Ты работаешь над задачей {task_tag} с доски mxBoard — вопросы в "
+                "чат отключены. Напиши комментарий в задаче (task_comment) и "
+                "заверши ход: ответ придёт следующим триггером. Перед опасным "
+                "действием так же остановись и спроси комментарием, не делай его "
+                "на своё усмотрение."
+            ),
+        }
+
     now = datetime.utcnow().isoformat()
 
     with _connect() as conn:
