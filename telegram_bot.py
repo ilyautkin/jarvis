@@ -93,6 +93,21 @@ from bot.queues import (
     finish_agent_trigger,
     finish_job,
 )
+from bot.topics import (
+    PERSISTENT_IDLE_MINUTES,
+    _key,
+    _lock_for,
+    active_procs,
+    chat_locks,
+    load_message_context,
+    pending_queue,
+    persistent_workers,
+    resolve_manager_topic,
+    resolve_topic_role,
+    save_message_context,
+    spawn_procs,
+)
+from bot.formatting import _html_escape, md_to_html, split_html_for_telegram
 
 logger = logging.getLogger(__name__)
 
@@ -512,67 +527,6 @@ async def _send_manager_notice(
     except Exception:
         logger.exception("auto-kick INSERT failed (kind=%s)", kind)
     return msg_id
-
-
-def resolve_manager_topic() -> tuple[int, int] | None:
-    """Return (chat_id, thread_id) of the Manager's topic, or None.
-
-    Two uses: the «report back to Manager» instruction in the SYSTEM NOTE of
-    delegated jobs, and the topic role that decides which credentials an
-    external MCP server gets (see resolve_topic_role).
-
-    Set both JARVIS_MANAGER_CHAT_ID and JARVIS_MANAGER_THREAD_ID to enable it.
-    Without them Jarvis has no Manager topic — a single-topic install does not
-    need one. (Until 2026-07-25 this fell back to a SQL lookup for a directory
-    layout private to the author, which silently did nothing for anyone else.)
-    """
-    raw_chat = os.environ.get("JARVIS_MANAGER_CHAT_ID")
-    raw_thread = os.environ.get("JARVIS_MANAGER_THREAD_ID")
-    if not (raw_chat and raw_thread):
-        return None
-    try:
-        return int(raw_chat), int(raw_thread)
-    except ValueError:
-        logger.warning(
-            "JARVIS_MANAGER_{CHAT,THREAD}_ID not int: %r/%r", raw_chat, raw_thread,
-        )
-        return None
-
-
-def resolve_topic_role(key: tuple[int, int]) -> str:
-    """Role of a Jarvis topic: 'manager' for the orchestrating topic, else 'agent'.
-
-    The selected LLM engine is irrelevant here — the role belongs to the topic.
-    External MCP servers use it to pick credentials, so that one forum can act
-    under two identities without either leaking into the other's topics.
-    """
-    return "manager" if resolve_manager_topic() == key else "agent"
-
-
-def save_message_context(chat_id: int, message_id: int, ctx: dict) -> None:
-    with _db() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO messages(chat_id, message_id, context_json, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (chat_id, message_id, json.dumps(ctx, ensure_ascii=False),
-             datetime.utcnow().isoformat()),
-        )
-
-
-def load_message_context(chat_id: int, message_id: int) -> dict | None:
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT context_json, created_at FROM messages WHERE chat_id = ? AND message_id = ?",
-            (chat_id, message_id),
-        ).fetchone()
-        if not row:
-            return None
-        try:
-            ctx = json.loads(row[0])
-        except json.JSONDecodeError:
-            return None
-        ctx["_created_at"] = row[1]
-        return ctx
 
 
 # ---------- Сессии ----------
@@ -1266,31 +1220,6 @@ def clear_cwd(chat_id: int, thread_id: int) -> None:
         )
 
 
-# ---------- Ключ per-topic ----------
-
-def _key(update: Update) -> tuple[int, int]:
-    chat_id = update.effective_chat.id
-    msg = update.message or update.effective_message
-    thread_id = 0
-    if msg is not None and getattr(msg, "is_topic_message", False):
-        thread_id = msg.message_thread_id or 0
-    return chat_id, thread_id
-
-
-chat_locks: dict[tuple[int, int], asyncio.Lock] = {}
-active_procs: dict[tuple[int, int], asyncio.subprocess.Process] = {}
-# Отдельный реестр для /spawn: key=(chat_id, thread_id, spawn_id_hex).
-# Основной /stop не трогает эти процессы; снять spawn можно через /stop <spawn_id>.
-spawn_procs: dict[tuple[int, int, str], asyncio.subprocess.Process] = {}
-
-# Живые процессы для топиков с /persistent on. Отдельно от active_procs:
-# эти сообщения НЕ идут через chat_locks — сообщение, пришедшее пока живой
-# процесс занят ходом, дописывается в него, а не ждёт очереди.
-persistent_workers: dict[tuple[int, int], object] = {}
-
-# Простаивающий живой процесс не экономит токены (сессия и так резюмируется
-# с диска) — только задержку на старте. Держать его вечно смысла нет.
-PERSISTENT_IDLE_MINUTES = _int_env_raw("JARVIS_PERSISTENT_IDLE_MINUTES", 20)
 
 
 async def _kill_persistent_worker(key: tuple[int, int], reason: str) -> bool:
@@ -1406,109 +1335,9 @@ async def close_requests_worker(app: Application) -> None:
             logger.exception("close_requests_worker loop crashed; continuing")
 
 
-def _lock_for(key: tuple[int, int]) -> asyncio.Lock:
-    lock = chat_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        chat_locks[key] = lock
-    return lock
-
-
-# Реестр отменяемых ожидающих запросов: queue_id -> asyncio.Event.
-# Когда запрос ждёт освобождения lock'а топика, в реестре лежит его event.
-# Callback "cancel_queue:<queue_id>" выставляет event, ожидающая корутина видит
-# это и выходит, не захватывая lock и не вызывая claude.
-# Когда запрос уже начал выполняться (lock захвачен) — его id удаляется из реестра;
-# попытка отменить в этот момент отвечает пользователю «используй /stop».
-pending_queue: dict[str, asyncio.Event] = {}
-
-
-# ---------- Markdown → HTML для Telegram ----------
-
-def _html_escape(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ```lang\n...\n```  (multiline) или ```...```
-_FENCE_RE = re.compile(r"```([A-Za-z0-9_+\-]*)\n?(.*?)```", re.DOTALL)
-_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
-_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-_ITALIC_RE = re.compile(r"(?<![\*A-Za-z0-9])\*(?!\s)(.+?)(?<!\s)\*(?![\*A-Za-z0-9])", re.DOTALL)
-
-
-def md_to_html(text: str) -> str:
-    """Конвертирует упрощённый markdown от claude в HTML, понятный Telegram.
-    Поддерживает: ```code blocks``` (с языком), `inline`, **bold**, *italic*.
-    Всё, что вне кода, экранируется (<, >, &); внутри кода — тоже."""
-    placeholders: list[str] = []
-
-    def _stash(html: str) -> str:
-        placeholders.append(html)
-        return f"\x00PH{len(placeholders) - 1}\x00"
-
-    def _fence(m: re.Match) -> str:
-        lang = m.group(1) or ""
-        body = m.group(2)
-        body_esc = _html_escape(body)
-        if lang:
-            return _stash(f'<pre><code class="language-{_html_escape(lang)}">{body_esc}</code></pre>')
-        return _stash(f"<pre><code>{body_esc}</code></pre>")
-
-    def _inline(m: re.Match) -> str:
-        return _stash(f"<code>{_html_escape(m.group(1))}</code>")
-
-    text = _FENCE_RE.sub(_fence, text)
-    text = _INLINE_CODE_RE.sub(_inline, text)
-    text = _html_escape(text)
-    text = _BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
-    text = _ITALIC_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
-
-    def _restore(m: re.Match) -> str:
-        return placeholders[int(m.group(1))]
-
-    return re.sub(r"\x00PH(\d+)\x00", _restore, text)
-
-
-def split_html_for_telegram(html: str, limit: int = TG_HARD_LIMIT) -> list[str]:
-    """Бьёт HTML на куски ≤ limit, не разрывая открытые <pre>/<code>.
-    Стратегия: режем по \\n, если внутри куска остался незакрытый <pre><code> —
-    закрываем в конце куска и переоткрываем в начале следующего."""
-    if len(html) <= limit:
-        return [html]
-    # Делим по строкам.
-    lines = html.split("\n")
-    chunks: list[str] = []
-    cur = ""
-    for line in lines:
-        candidate = (cur + "\n" + line) if cur else line
-        if len(candidate) <= limit:
-            cur = candidate
-            continue
-        if cur:
-            chunks.append(cur)
-        # Если сама строка длиннее лимита — режем грубо по символам.
-        while len(line) > limit:
-            chunks.append(line[:limit])
-            line = line[limit:]
-        cur = line
-    if cur:
-        chunks.append(cur)
-    # Балансируем <pre><code> между чанками.
-    balanced: list[str] = []
-    open_pre = False
-    for ch in chunks:
-        prefix = "<pre><code>" if open_pre else ""
-        body = prefix + ch
-        # Простой подсчёт: count open vs close <pre>.
-        opens = body.count("<pre>")
-        closes = body.count("</pre>")
-        if opens > closes:
-            body += "</code></pre>"
-            open_pre = True
-        else:
-            open_pre = False
-        balanced.append(body)
-    return balanced
 
 
 # ---------- Отправка в топик ----------
