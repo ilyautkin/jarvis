@@ -38,9 +38,9 @@
 - Playwright MCP — **on-demand** для любого движка (`claude`/`codex`/`opencode`):
   включается per-topic командой `/browser on` и инъектируется в CLI на каждый
   запрос, без постоянной глобальной регистрации.
-- mxBoard MCP — **role-based** per-topic: manager-topic подключается как
-  `ai-manager`, все остальные топики как `ai-agent`. Движок (`claude`/`codex`/
-  `opencode`) на личность в mxBoard не влияет.
+- Внешние MCP-серверы — **по роли топика**: топик-оркестратор («Менеджер») и
+  рабочие топики ходят во внешний сервис разными кредами, не перемешивая
+  личности. Объявляются одним JSON-файлом; движок на роль не влияет.
 - Голосовые не поддерживаются.
 - Whitelist по `user_id` (см. `ALLOWED_USER_IDS`).
 
@@ -114,16 +114,13 @@ claude -p "hello"   # проверка, что авторизация работ
 - `JARVIS_MCP_PYTHON` — путь к Python для запуска MCP-сервера (по умолчанию
   `venv/bin/python` репозитория jarvis).
 - `JARVIS_MCP_SCRIPT` / `JARVIS_MCP_DB` — переопределить пути к серверу/БД.
-- `JARVIS_MXBOARD_MCP` — `1`/`0`, глобальный рубильник mxBoard MCP. `1`
-  (по умолчанию) — Jarvis инъектирует mxBoard MCP на каждый вызов с ролью
-  текущего топика.
-- `JARVIS_MXBOARD_AGENTS_CONFIG` — путь к gitignored JSON с `mcp_url` и токенами
-  ролей. По умолчанию `/home/shevartv/projects/apps/mxboard/config/mxboard-agents.json`.
-- `JARVIS_MXBOARD_MCP_NAME` — имя MCP-сервера в CLI-конфигах (по умолчанию
-  `mxboard`).
-- `JARVIS_MXBOARD_MANAGER_USERNAME` / `JARVIS_MXBOARD_AGENT_USERNAME` — подписи
-  ролей для логов, по умолчанию `ai-manager` / `ai-agent`. На авторизацию влияет
-  токен, а не это имя.
+- `JARVIS_TOPIC_MCP_CONFIG` — путь к JSON с внешними MCP-серверами по роли
+  топика (см. «Внешние MCP-серверы по роли топика»). Не задан или файла нет →
+  таких серверов нет, это не ошибка.
+- `JARVIS_TOPIC_MCP` — `1`/`0`, глобальный рубильник для них. Дефолт `1`.
+- `JARVIS_MANAGER_CHAT_ID` / `JARVIS_MANAGER_THREAD_ID` — топик Менеджера.
+  Нужны обе: они задают, какой топик получает роль `manager` и куда уходят
+  отчёты по делегированным задачам. Не заданы — Менеджера у установки нет.
 - `JARVIS_LOG_TTL_DAYS` — сколько дней хранить записи `messages_log`,
   завершённые (`done`/`failed`/`cancelled`) `jobs` и завершённые
   `agent_triggers`. Дефолт `30`. `0`, `none`, `off`, `false`, `no` —
@@ -134,7 +131,7 @@ claude -p "hello"   # проверка, что авторизация работ
   одновременно; внутри одного топика — строго по очереди (per-topic лок). При
   `1` поведение как раньше (одна задача за раз).
 - `JARVIS_AGENT_TRIGGERS_CONCURRENCY` — сколько внешних non-job триггеров
-  (`agent_triggers`, сейчас mxBoard poller) выполнять параллельно. Дефолт `5`,
+  (`agent_triggers`, см. «Внешние триггеры») выполнять параллельно. Дефолт `5`,
   минимум `1`. Триггеры не имеют `job_id` и не участвуют в `manager_interrupt`
   / heartbeat jobs.
 - `JARVIS_HEARTBEAT_INTERVAL` — частота сканирования in_progress job'ов
@@ -197,52 +194,96 @@ Playwright **не** регистрируется глобально, а инъе
 >
 > claude (основной канал) работает через `--mcp-config` без оговорок.
 
-### mxBoard MCP — роли ai-manager / ai-agent
+### Внешние MCP-серверы по роли топика
 
-mxBoard подключается не по выбранному движку, а по роли Telegram-топика:
-`resolve_mxboard_role_for_topic()` сравнивает `(chat_id, thread_id)` с
-`resolve_manager_topic()`. Если это manager-topic, CLI получает токен
-`ai-manager`; любой проектный/исполнительский топик получает токен `ai-agent`.
+Один форум часто обслуживает две разные личности: топик-оркестратор
+(«Менеджер») и рабочие топики проектов. Если у обоих один и тот же внешний
+сервис — трекер задач, доска, внутреннее API — им обычно нужны **разные креды**,
+и путать их нельзя: ход, сделанный от лица исполнителя, не должен выглядеть как
+ход Менеджера.
 
-Источник токенов — gitignored
-`/home/shevartv/projects/apps/mxboard/config/mxboard-agents.json`. Jarvis
-поддерживает переходный формат с `manager` + `executors`: токен агента берётся
-из `agent.token`, если он есть, иначе из executor с username `ai-agent`, иначе из
-первого executor. Это нужно, чтобы переименование MODX-пользователей
-`codex`/`claude-agent` в `ai-manager`/`ai-agent` не ломало уже выпущенные токены.
+Jarvis решает это ролью топика. `resolve_topic_role()` сравнивает
+`(chat_id, thread_id)` с `resolve_manager_topic()` (env `JARVIS_MANAGER_CHAT_ID`
++ `JARVIS_MANAGER_THREAD_ID`) и отдаёт `manager` либо `agent`. Выбранный движок
+на роль не влияет — роль принадлежит топику.
+
+Сами серверы объявляются в JSON-файле из `JARVIS_TOPIC_MCP_CONFIG` — про сам
+сервис Jarvis не знает ничего:
+
+```json
+{
+  "servers": [
+    {
+      "name": "mxboard",
+      "url": "https://example.org/rest-mcp.php",
+      "roles": {
+        "manager": {"headers": {"Authorization": "Bearer <manager-token>"}},
+        "agent":   {"headers": {"Authorization": "Bearer <agent-token>"}}
+      }
+    }
+  ]
+}
+```
+
+- `roles` необязателен: без него сервер подключается любой роли с общими
+  `headers`. С ним — только перечисленным ролям, а `headers` роли перекрывают
+  общие. Роль может переопределить и `url`.
+- `enabled: false` выключает запись, не удаляя её.
+- Поддерживаются только **remote HTTP** серверы: роль здесь — это креды, а
+  stdio-сервер несёт их в argv/env, откуда они видны в списке процессов.
+- Файл перечитывается по mtime — правка токена подхватывается без рестарта.
+- `JARVIS_TOPIC_MCP=0` — глобальный рубильник.
+
+**Отсутствие конфига — не ошибка.** Нет переменной, нет файла, битый JSON, плохая
+запись: Jarvis пишет это в лог и работает без этих серверов. Топик без тула —
+неудобство, бот, который вообще не отвечает, — авария; до 2026-07-25 это было
+ровно второе (нехватка файла роняла `RuntimeError` на КАЖДОМ сообщении).
 
 Инъекция по движкам:
 
-- **claude**: `--mcp-config` с remote HTTP server и Bearer header.
-- **codex**: обычный `codex exec` использует временный
-  `$CODEX_HOME/jarvis-mxboard-*.config.toml` + `--profile-v2 <name>`, чтобы
-  Bearer-токен не попадал в process argv. Файл создаётся с mode `0600` и
-  удаляется после завершения `codex exec`.
-  `--profile-v2` — глобальный флаг Codex CLI, поэтому он должен стоять перед
-  subcommand: `codex --profile-v2 <name> exec resume ...`. Persistent
-  `codex app-server` не поддерживает `--profile-v2`, поэтому mxBoard MCP для
-  него передаётся через `-c mcp_servers.mxboard.*`.
-- **opencode**: временный `OPENCODE_CONFIG`, куда добавляется remote
-  `mcp.mxboard`; файл удаляется после ответа.
+- **claude**: `--mcp-config` с remote HTTP server и headers.
+- **codex**: `codex exec` получает временный
+  `$CODEX_HOME/jarvis-topic-mcp-*.config.toml` + `--profile-v2 <name>`, чтобы
+  токены не попадали в process argv. Файл создаётся с mode `0600` и удаляется
+  после завершения процесса. `--profile-v2` — глобальный флаг Codex CLI, он
+  обязан стоять ПЕРЕД subcommand: `codex --profile-v2 <name> exec resume ...`.
+  Persistent `codex app-server` `--profile-v2` не поддерживает, поэтому там
+  используется `-c mcp_servers.<name>.*` (токен при этом в argv — цена
+  persistent-режима).
+- **opencode**: временный `OPENCODE_CONFIG` — клон глобального `opencode.json`
+  плюс `mcp.<name>`; удаляется после ответа. Если подключать нечего, temp-файл
+  НЕ создаётся и opencode идёт со своим штатным конфигом.
 
-Глобальные user-scope регистрации `mxboard` в `~/.codex/config.toml` и
+Глобальные user-scope регистрации этих серверов в `~/.codex/config.toml` и
 `~/.claude.json` должны отсутствовать, иначе identity снова станет зависеть от
 конфига CLI, а не от роли топика.
 
-### mxBoard poller → agent_triggers
+> **Живой пример.** [`jarvis-mxboard-poller`](../jarvis-mxboard-poller) — мост
+> из канбана mxBoard: поднимает агента на событиях доски и подключает её MCP
+> обеими личностями. Он же поставляет шаблон файла выше. Jarvis о mxBoard не
+> знает ничего — вся специфика доски живёт в поллере.
 
-`jarvis-mxboard-poller` не должен писать в Jarvis `jobs`: job-обёртка создаёт
-служебные manager-notice на финальном ответе и interrupt, что даёт ложные
-пробуждения Менеджера. Для board-handoff есть отдельная таблица
-`agent_triggers`: poller вставляет `chat_id/thread_id/text/source='mxboard'`,
-а `agent_triggers_worker` запускает обычный LLM turn в топике через тот же
-topic-lock и `/persistent` путь, но без `job_id`, heartbeat и
-`manager_interrupt`. Перед запуском worker логирует входящее в `messages_log`
-как `mxboard_inject`.
+### Внешние триггеры (`agent_triggers`)
 
-Колонка `role` (с 2026-07-22) хранит, кому адресован триггер: `'executor'` или
-`'manager'`. Пишет её poller, читает `ask_user` — см. ниже. `NULL` = роль
-неизвестна (старая запись либо ещё не перезапущенный poller).
+Публичный контракт для любой интеграции — трекера задач, CI, cron: вставь строку
+в `agent_triggers`, и бот проведёт обычный LLM turn в топике.
+
+```sql
+INSERT INTO agent_triggers(chat_id, thread_id, text, source, role, status, created_at)
+VALUES (?, ?, ?, 'mytracker', 'executor', 'pending', ?);
+```
+
+Почему отдельная таблица, а не `jobs`: job-обёртка создаёт служебные
+manager-notice на финальном ответе и interrupt, что даёт ложные пробуждения
+Менеджера. `agent_triggers_worker` запускает ход через тот же topic-lock и
+`/persistent`-путь, но **без** `job_id`, heartbeat и `manager_interrupt`. Перед
+запуском входящее логируется в `messages_log` как `<source>_inject`.
+
+- `source` — свободная метка интеграции, нужна для логов и текста отказа
+  `ask_user`.
+- `role` — кому адресован триггер: `'executor'` или `'manager'`. Пишет
+  интегратор, читает `ask_user` (см. ниже). `NULL` = роль неизвестна, такие
+  триггеры гард не блокирует.
 
 ### Вопросы агента пользователю (`ask_user`)
 
@@ -272,15 +313,19 @@ options=[...])` публикует вопрос в топик и **блокир�
 необратимыми действиями и при неоднозначной задаче — и не дёргать человека по
 тому, что можно выяснить самому (прочитать код, запустить команду, глянуть git).
 
-#### Запрет для исполнителя задачи mxBoard (с 2026-07-22)
+#### Запрет для исполнителя внешней задачи (с 2026-07-22)
 
-Если ход поднят poller-ом и адресован **исполнителю** (`agent_triggers` этого
-топика: `status='in_progress'`, `source='mxboard'`, `role='executor'`), любой
+Если ход поднят внешней интеграцией и адресован **исполнителю**
+(`agent_triggers` этого топика: `status='in_progress'`, `role='executor'`), любой
 вызов `ask_user` отклоняется: в Telegram ничего не уходит, агент получает
-`{status:'blocked', task:'#N', error:...}` с требованием задать вопрос
-комментарием в карточке и завершить ход. Ответ человека комментарием поллер
+`{status:'blocked', task:'#N', source:..., error:...}` с требованием задать
+вопрос комментарием в задаче и завершить ход. Ответ человека интеграция
 подхватит и разбудит агента новым триггером — диалог по задаче целиком остаётся
 в её истории, а не растекается по чату.
+
+Гард смотрит на `role`, а **не** на `source`: контракт общий для любого трекера.
+До 2026-07-25 в SQL был зашит `source='mxboard'`, и чужая интеграция гарда не
+получала.
 
 Менеджера запрет не касается (`role='manager'`), как и обычных ходов от
 сообщений человека. `role IS NULL` или отсутствие колонки → запрет **не**
@@ -314,9 +359,9 @@ stdio://` отвечает на `initialize`, создаёт thread через `
 turn.
 
 Playwright MCP в persistent Codex подключается через `-c
-mcp_servers.playwright.*` overrides при старте app-server; mxBoard MCP — через
-`-c mcp_servers.mxboard.*`, потому что `app-server` не принимает
-`--profile-v2`. Роль mxBoard и флаг `/browser` нужно выставить до
+mcp_servers.playwright.*` overrides при старте app-server; topic-MCP — через
+`-c mcp_servers.<name>.*`, потому что `app-server` не принимает
+`--profile-v2`. Роль топика и флаг `/browser` нужно выставить до
 первого persistent-сообщения в топике: уже запущенный живой процесс не
 перечитывает MCP-конфиг до перезапуска worker-а (`/stop`, `/new`, `/reset`,
 `/engine`, `/persistent off/on` или idle reaper).
@@ -436,8 +481,9 @@ Per-topic MCP — часть контракта `Engine.call_stream` (см.
   (флаг конфига / оверрайд / временный конфиг через env). Если CLI вообще не
   умеет per-invocation MCP — задокументируй ручную глобальную настройку как
   фолбэк (раздел выше).
-- `mcp_mxboard_role: str | None` — если задано, инъектируй mxBoard MCP с ролью
-  `manager` или `agent` через `mxboard_role_spec()`. Для CLI, где секреты могли
+- `mcp_topic_role: str | None` — если задано, инъектируй внешние MCP-серверы
+  этой роли через `engines.topic_mcp.servers_for_role()` (пустой список —
+  штатная ситуация, серверов нет). Для CLI, где секреты могли
   бы попасть в argv, используй файл/профиль, а не command-line override.
 
 ### Jarvis Manager MCP (для агента-Менеджера)
@@ -532,16 +578,48 @@ journalctl --user -u jarvis-bot -f
 
 ## Файлы
 
-- `telegram_bot.py` — весь бот.
+- `telegram_bot.py` — весь бот: команды, воркеры, схема БД, роутинг сообщений.
 - `config.py` — чтение `.env`, токен и whitelist.
-- `requirements.txt` — зависимости (`python-telegram-bot`, `python-dotenv`).
-- `engines/playwright_mcp.py` — runtime-настройка Playwright MCP для
-  активного движка.
-- `engines/model_cache.py` — TTL-кэш списков моделей (движки спрашивают их
-  у своих CLI, а не хардкодят).
-- `bot_state.db` — sqlite: session-id на чат + метаданные исходящих сообщений (для reply-to).
+- `requirements.txt` — зависимости (`python-telegram-bot`, `python-dotenv`, `mcp`).
+- `webhook_server.py` — HTTP-приём внешних уведомлений.
+- `imap_watcher.py` — вотчер почты (см. `JARVIS_IMAP_*`).
+
+Движки (`engines/`):
+
+- `__init__.py` — протокол `Engine`, реестр движков, `engine_model_scope()`.
+- `claude_engine.py`, `codex_engine.py`, `opencode_engine.py` — адаптеры CLI.
+- `persistent_codex.py` — живой Codex app-server для `/persistent`.
+- `playwright_mcp.py` — runtime-настройка Playwright MCP для активного движка.
+- `topic_mcp.py` — внешние MCP-серверы по роли топика.
+- `jarvis_mcp.py` — регистрация Jarvis Manager MCP в конфигах движков.
+- `model_cache.py` — TTL-кэш списков моделей (движки спрашивают их у своих CLI,
+  а не хардкодят).
+- `session_usage.py` — оценка размера сессии для `/tokens`.
+- `process_control.py` — снятие дерева процессов движка.
+
+Скрипты (`scripts/`):
+
+- `jarvis_mcp_server.py` — сам Jarvis Manager MCP (`ask_user`, `manager_*`).
+- `session_tokens.py` — CLI-отчёт по расходу токенов.
+- `sync_codex_knowledge.py` — личная утилита автора (синк базы знаний в
+  `AGENTS.md`); для установки Jarvis не нужна.
+
+Состояние и прочее:
+
+- `bot_state.db` — sqlite: сессии топиков, `jobs`, `agent_triggers`,
+  `messages_log`, `reminders`, метаданные исходящих сообщений (для reply-to).
 - `temp/media/` — скачанные пользовательские вложения.
 - `systemd/jarvis-bot.service` — user-unit.
+- `tests/` — юнит-тесты, запуск: `./venv/bin/python -m unittest discover -s tests`.
+
+## Тесты
+
+```bash
+./venv/bin/python -m unittest discover -s tests
+```
+
+Внешних сервисов и токенов не требуют: конфиги подкладываются во временные
+каталоги, Telegram API и запуски CLI мокаются.
 
 ## Известные ограничения
 

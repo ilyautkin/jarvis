@@ -76,7 +76,7 @@ DEFAULT_ENGINE = get_engine_by_name(DEFAULT_ENGINE_NAME)
 
 # Дефолтный cwd для топиков без явного /bind. Имя переменной историческое (CLAUDE_CWD),
 # для обратной совместимости: задаёт дефолт для любого движка.
-CLAUDE_CWD = os.environ.get("CLAUDE_CWD", "/home/shevartv")
+CLAUDE_CWD = os.environ.get("CLAUDE_CWD") or os.path.expanduser("~")
 
 def _int_env_raw(name: str, default: int) -> int:
     try:
@@ -143,8 +143,7 @@ def build_system_prefix(
     """
     lines = [
         "[SYSTEM: Сообщение пришло от пользователя через Telegram-бота Jarvis.",
-        f"Ты работаешь в проекте {effective_cwd}. Используй memory-правила из "
-        "~/.claude/projects/-home-shevartv/memory/.",
+        f"Ты работаешь в проекте {effective_cwd}.",
     ]
     if key is not None:
         lines.append(
@@ -497,10 +496,12 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_jobs_pending "
             "ON jobs(status, not_before, created_at)"
         )
-        # Очередь внешних триггеров без job-семантики. Используется mxBoard
-        # poller-ом: нужно запустить обычный LLM turn в топике, но без job_id,
-        # health_worker, manager_interrupt и safety-notice Менеджеру на ответ
-        # или interrupt.
+        # Очередь внешних триггеров без job-семантики — публичный контракт для
+        # любого интегратора (issue tracker, CI, cron): вставь строку, и бот
+        # проведёт обычный LLM turn в топике, но без job_id, health_worker,
+        # manager_interrupt и safety-notice Менеджеру на ответ или interrupt.
+        # source — свободная метка интеграции ('mxboard' у поллера доски),
+        # нужна только для логов и гарда ask_user ниже.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS agent_triggers (
@@ -508,7 +509,7 @@ def init_db() -> None:
                 chat_id INTEGER NOT NULL,
                 thread_id INTEGER NOT NULL,
                 text TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'mxboard',
+                source TEXT NOT NULL DEFAULT 'external',
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL,
                 claimed_at TEXT,
@@ -520,9 +521,10 @@ def init_db() -> None:
             """
         )
         # Idempotent миграция: role — кому адресован триггер ('executor' |
-        # 'manager'). Пишет поллер; читает ask_user в MCP-сервере, чтобы
-        # запретить вопросы в чат исполнителю, работающему по задаче доски.
-        # NULL = роль неизвестна (старая запись / поллер ещё не обновлён) —
+        # 'manager'). Пишет интегратор; читает ask_user в MCP-сервере, чтобы
+        # запретить вопросы в чат исполнителю, работающему по внешней задаче:
+        # там весь диалог принадлежит трекеру, а не Telegram.
+        # NULL = роль неизвестна (старая запись / интегратор её не пишет) —
         # такие не блокируем.
         cols_now = [
             r[1] for r in conn.execute("PRAGMA table_info(agent_triggers)").fetchall()
@@ -691,9 +693,9 @@ def claim_next_agent_trigger(
 ) -> dict | None:
     """Atomically claim one pending non-job trigger.
 
-    This queue is for mxBoard/poller handoff: run a normal LLM turn in the
-    topic, but do not create/finish a Jarvis job and do not emit job safety
-    notices.
+    This queue is for external-integration handoff (see agent_triggers in
+    init_db): run a normal LLM turn in the topic, but do not create/finish a
+    Jarvis job and do not emit job safety notices.
     """
     now = datetime.utcnow().isoformat()
     sql = (
@@ -1145,40 +1147,34 @@ async def _send_manager_notice(
 def resolve_manager_topic() -> tuple[int, int] | None:
     """Return (chat_id, thread_id) of the Manager's topic, or None.
 
-    Used to inject the «report back to Manager» instruction into the SYSTEM
-    NOTE of delegated jobs. Falls back to a SQL lookup so the bot works out
-    of the box for the default Shevartv setup; explicit env vars override
-    for unusual deployments.
+    Two uses: the «report back to Manager» instruction in the SYSTEM NOTE of
+    delegated jobs, and the topic role that decides which credentials an
+    external MCP server gets (see resolve_topic_role).
+
+    Set both JARVIS_MANAGER_CHAT_ID and JARVIS_MANAGER_THREAD_ID to enable it.
+    Without them Jarvis has no Manager topic — a single-topic install does not
+    need one. (Until 2026-07-25 this fell back to a SQL lookup for a directory
+    layout private to the author, which silently did nothing for anyone else.)
     """
     raw_chat = os.environ.get("JARVIS_MANAGER_CHAT_ID")
     raw_thread = os.environ.get("JARVIS_MANAGER_THREAD_ID")
-    if raw_chat and raw_thread:
-        try:
-            return int(raw_chat), int(raw_thread)
-        except ValueError:
-            logger.warning(
-                "JARVIS_MANAGER_{CHAT,THREAD}_ID not int: %r/%r",
-                raw_chat, raw_thread,
-            )
+    if not (raw_chat and raw_thread):
+        return None
     try:
-        with _db() as conn:
-            row = conn.execute(
-                "SELECT chat_id, thread_id FROM sessions "
-                "WHERE thread_id > 0 AND cwd LIKE '%/knowledge-base/manager' "
-                "ORDER BY updated_at DESC LIMIT 1"
-            ).fetchone()
-        if row:
-            return row[0], row[1]
-    except Exception:
-        logger.exception("resolve_manager_topic failed")
-    return None
+        return int(raw_chat), int(raw_thread)
+    except ValueError:
+        logger.warning(
+            "JARVIS_MANAGER_{CHAT,THREAD}_ID not int: %r/%r", raw_chat, raw_thread,
+        )
+        return None
 
 
-def resolve_mxboard_role_for_topic(key: tuple[int, int]) -> str:
-    """mxBoard MCP identity for a Jarvis topic.
+def resolve_topic_role(key: tuple[int, int]) -> str:
+    """Role of a Jarvis topic: 'manager' for the orchestrating topic, else 'agent'.
 
-    The selected LLM engine is irrelevant here: the Manager topic acts in
-    mxBoard as ai-manager, every execution/project topic acts as ai-agent.
+    The selected LLM engine is irrelevant here — the role belongs to the topic.
+    External MCP servers use it to pick credentials, so that one forum can act
+    under two identities without either leaking into the other's topics.
     """
     return "manager" if resolve_manager_topic() == key else "agent"
 
@@ -2470,7 +2466,7 @@ async def call_llm_stream(
     # (строка про browser_* только когда Playwright подключён) и передаём в
     # системный канал движка вместо вшивания в каждый prompt.
     mcp_playwright = get_mcp_playwright(*key)
-    mcp_mxboard_role = resolve_mxboard_role_for_topic(key)
+    mcp_topic_role = resolve_topic_role(key)
     effective_cwd = cwd or CLAUDE_CWD
     system_prefix = build_system_prefix(effective_cwd, mcp_playwright, key=key)
 
@@ -2485,7 +2481,7 @@ async def call_llm_stream(
         spawn_id=spawn_id,
         system_prefix=system_prefix,
         mcp_playwright=mcp_playwright,
-        mcp_mxboard_role=mcp_mxboard_role,
+        mcp_topic_role=mcp_topic_role,
     )
     # Recovery: иногда opencode/codex на resume могут вернуть rc=0, но пустой
     # текст. Для постоянной сессии делаем один автоповтор в новой сессии.
@@ -2512,7 +2508,7 @@ async def call_llm_stream(
                 spawn_id=spawn_id,
                 system_prefix=system_prefix,
                 mcp_playwright=mcp_playwright,
-                mcp_mxboard_role=mcp_mxboard_role,
+                mcp_topic_role=mcp_topic_role,
             )
             ok, final_text, sid_after, actual_model = ok2, final_text2, sid_after2, actual_model2
             session_id = new_sid
@@ -3796,7 +3792,7 @@ async def _handle_persistent_message(
             pending_summary = await _resolve_pending_summary(key, pending_raw)
 
         mcp_playwright = get_mcp_playwright(*key)
-        mcp_mxboard_role = resolve_mxboard_role_for_topic(key)
+        mcp_topic_role = resolve_topic_role(key)
         effective_cwd = cwd or CLAUDE_CWD
         system_prefix = build_system_prefix(effective_cwd, mcp_playwright, key=key)
 
@@ -3805,13 +3801,13 @@ async def _handle_persistent_message(
                 worker = await start_persistent_claude(
                     key=key, session_id=session_id, cwd=effective_cwd, model=model,
                     system_prefix=system_prefix, mcp_playwright=mcp_playwright,
-                    mcp_mxboard_role=mcp_mxboard_role,
+                    mcp_topic_role=mcp_topic_role,
                 )
             elif engine_name == "codex":
                 worker = await start_persistent_codex(
                     key=key, session_id=session_id, cwd=effective_cwd, model=model,
                     system_prefix=system_prefix, mcp_playwright=mcp_playwright,
-                    mcp_mxboard_role=mcp_mxboard_role,
+                    mcp_topic_role=mcp_topic_role,
                 )
                 if worker.session_id and worker.session_id != session_id:
                     update_session_id(key[0], key[1], "codex", worker.session_id)
@@ -4206,8 +4202,8 @@ async def _run_manager_job(app: Application, job: dict) -> tuple[bool, int | Non
                 f"с тегом #ask_{job_id}, ничего не реализуй. Жди следующего "
                 f"сообщения.\n"
                 f"3. При правках на ПРОДЕ — обязательный smoke-check после: "
-                f"ищи команду в knowledge-base/projects/<имя>/production_smoke_check.md "
-                f"(или подобном файле). Если smoke упал — откатить через "
+                f"ищи команду в документации проекта (например "
+                f"production_smoke_check.md). Если smoke упал — откатить через "
                 f"git revert и сообщить ❌ в финальном ответе. Если файла "
                 f"smoke-check нет — задай уточняющий вопрос через #ask.\n"
                 f"4. (опционально) По завершении CODE-задачи можешь "
@@ -4820,7 +4816,7 @@ async def _post_init(application: Application) -> None:
     task = asyncio.create_task(jobs_worker(application))
     application.bot_data["jobs_worker_task"] = task
 
-    # Non-job external triggers (mxBoard poller): обычный LLM turn в топике
+    # Non-job external triggers (внешние интеграции): обычный LLM turn в топике
     # без job_id, health_worker и safety-notice Менеджеру.
     trigger_task = asyncio.create_task(agent_triggers_worker(application))
     application.bot_data["agent_triggers_worker_task"] = trigger_task

@@ -44,9 +44,12 @@ def _load_mcp_server():
     return module
 
 
-class AskUserMxBoardGuardTest(unittest.TestCase):
-    """Исполнителю, работающему по задаче доски, чат как канал закрыт:
-    ответ в нём осел бы мимо карточки. Менеджера это не касается."""
+class AskUserExternalGuardTest(unittest.TestCase):
+    """Исполнителю, работающему по задаче внешнего трекера, чат как канал
+    закрыт: ответ в нём осел бы мимо задачи. Менеджера это не касается.
+
+    Гард смотрит на role, а НЕ на source: контракт общий для любой
+    интеграции, не только для mxBoard (обобщено 2026-07-25)."""
 
     def _fresh_db(self, tmp: str) -> str:
         db_path = str(Path(tmp) / "bot_state.db")
@@ -94,7 +97,8 @@ class AskUserMxBoardGuardTest(unittest.TestCase):
                 ))
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["task"], "#482")
-        self.assertIn("task_comment", result["error"])
+        self.assertEqual(result["source"], "mxboard")
+        self.assertIn("#482", result["error"])
         api.assert_not_called()
 
     def test_manager_and_finished_triggers_do_not_block(self) -> None:
@@ -112,8 +116,20 @@ class AskUserMxBoardGuardTest(unittest.TestCase):
                 self._add_trigger(db_path, role, status=status, thread_id=thread_id)
                 with self.subTest(role=role, status=status):
                     self.assertIsNone(
-                        mcp_server._mxboard_executor_task(-100, thread_id)
+                        mcp_server._external_executor_task(-100, thread_id)
                     )
+
+    def test_guard_is_not_limited_to_one_integration(self) -> None:
+        """Любой source с role=executor блокирует — до 2026-07-25 в SQL был
+        зашит source='mxboard', и чужая интеграция гард не получала."""
+        mcp_server = _load_mcp_server()
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._fresh_db(tmp)
+            mcp_server._DB_PATH = Path(db_path)
+            self._add_trigger(db_path, "executor", source="jira", thread_id=201)
+            self.assertEqual(
+                mcp_server._external_executor_task(-100, 201), ("#482", "jira"),
+            )
 
     def test_missing_role_column_fails_open(self) -> None:
         mcp_server = _load_mcp_server()
@@ -127,7 +143,7 @@ class AskUserMxBoardGuardTest(unittest.TestCase):
                     (-100, 77, TRIGGER_TEXT, datetime.utcnow().isoformat()),
                 )
             mcp_server._DB_PATH = Path(db_path)
-            self.assertIsNone(mcp_server._mxboard_executor_task(-100, 77))
+            self.assertIsNone(mcp_server._external_executor_task(-100, 77))
 
     def test_trigger_without_task_tag_still_blocks(self) -> None:
         mcp_server = _load_mcp_server()
@@ -141,7 +157,9 @@ class AskUserMxBoardGuardTest(unittest.TestCase):
                     (-100, 88, "Событие по задаче без тега", datetime.utcnow().isoformat()),
                 )
             mcp_server._DB_PATH = Path(db_path)
-            self.assertEqual(mcp_server._mxboard_executor_task(-100, 88), "#?")
+            self.assertEqual(
+                mcp_server._external_executor_task(-100, 88), ("#?", "mxboard"),
+            )
 
 
 if __name__ == "__main__":

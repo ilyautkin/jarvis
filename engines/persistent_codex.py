@@ -32,7 +32,7 @@ INTERMEDIATE_MIN_INTERVAL = 2.0
 
 def _mcp_config_overrides(
     mcp_playwright: bool,
-    mcp_mxboard_role: str | None,
+    mcp_topic_role: str | None,
 ) -> tuple[list[str], list[Path]]:
     """App-server MCP flags and temporary files."""
     flags: list[str] = []
@@ -53,10 +53,10 @@ def _mcp_config_overrides(
                 "-c", f"{table}.enabled=true",
             ])
 
-    if mcp_mxboard_role:
-        from engines.mxboard_mcp import codex_inline_config_flags
+    if mcp_topic_role:
+        from engines.topic_mcp import codex_inline_config_flags
 
-        flags.extend(codex_inline_config_flags(mcp_mxboard_role))
+        flags.extend(codex_inline_config_flags(mcp_topic_role))
 
     return flags, cleanup_paths
 
@@ -391,7 +391,7 @@ class PersistentCodexWorker:
     def _cleanup_profiles(self) -> None:
         if not self._cleanup_paths:
             return
-        from engines.mxboard_mcp import cleanup_codex_profile
+        from engines.topic_mcp import cleanup_codex_profile
 
         paths = self._cleanup_paths
         self._cleanup_paths = []
@@ -438,14 +438,14 @@ async def start_persistent(
     model: str | None,
     system_prefix: str | None,
     mcp_playwright: bool,
-    mcp_mxboard_role: str | None = None,
+    mcp_topic_role: str | None = None,
 ) -> PersistentCodexWorker:
     """Start app-server and open/resume a Codex thread."""
     effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
     if not os.path.isdir(effective_cwd):
         raise RuntimeError(f"Рабочая папка `{effective_cwd}` не существует.")
 
-    mcp_flags, mcp_cleanup_paths = _mcp_config_overrides(mcp_playwright, mcp_mxboard_role)
+    mcp_flags, mcp_cleanup_paths = _mcp_config_overrides(mcp_playwright, mcp_topic_role)
     cmd = [
         CODEX_BIN,
         "app-server",
@@ -471,7 +471,7 @@ async def start_persistent(
             limit=10 * 1024 * 1024,
         )
     except Exception:
-        from engines.mxboard_mcp import cleanup_codex_profile
+        from engines.topic_mcp import cleanup_codex_profile
 
         for path in mcp_cleanup_paths:
             cleanup_codex_profile(path)

@@ -62,15 +62,42 @@ def _cleanup_tempfile(path: str | None) -> None:
         pass
 
 
-def _opencode_mcp_config(mcp_playwright: bool, mcp_mxboard_role: str | None) -> str | None:
+def _opencode_mcp_config(mcp_playwright: bool, mcp_topic_role: str | None) -> str | None:
     """Временный opencode-конфиг с per-topic MCP-серверами.
 
     Клонирует глобальный opencode.json (Manager MCP и прочие настройки
     сохраняются), добавляет нужные MCP в `mcp` и пишет во временный файл.
     Путь подставляется в OPENCODE_CONFIG для конкретного запуска.
     Вызывающий обязан удалить файл через _cleanup_tempfile.
+
+    ``None`` — добавлять нечего, запускаем opencode с его штатным конфигом.
+    Проверять надо именно СПИСОК серверов, а не роль: роль есть у каждого
+    топика всегда, поэтому ветка «роль задана → пишем temp-файл» подменяла
+    глобальный конфиг клоном на каждом ходу даже там, где ни одного сервера не
+    объявлено (найдено тестом 2026-07-25).
     """
-    if not mcp_playwright and not mcp_mxboard_role:
+    additions: dict[str, dict[str, Any]] = {}
+
+    if mcp_topic_role:
+        from engines.topic_mcp import opencode_mcp_servers
+
+        additions.update(opencode_mcp_servers(mcp_topic_role))
+
+    if mcp_playwright:
+        from engines.playwright_mcp import playwright_command_args, playwright_server_name
+
+        spec = playwright_command_args()
+        if spec is None:
+            logger.warning("mcp_playwright requested but Playwright globally disabled")
+        else:
+            npx, args = spec
+            additions[playwright_server_name()] = {
+                "type": "local",
+                "command": [npx, *args],
+                "enabled": True,
+            }
+
+    if not additions:
         return None
 
     from engines.playwright_mcp import OPENCODE_CONFIG as BASE_CONFIG
@@ -90,31 +117,7 @@ def _opencode_mcp_config(mcp_playwright: bool, mcp_mxboard_role: str | None) -> 
         mcp = {}
         base["mcp"] = mcp
 
-    if mcp_playwright:
-        from engines.playwright_mcp import playwright_command_args, playwright_server_name
-
-        spec = playwright_command_args()
-        if spec is None:
-            logger.warning("mcp_playwright requested but Playwright globally disabled")
-        else:
-            npx, args = spec
-            mcp[playwright_server_name()] = {
-                "type": "local",
-                "command": [npx, *args],
-                "enabled": True,
-            }
-
-    if mcp_mxboard_role:
-        from engines.mxboard_mcp import mxboard_role_spec
-
-        spec = mxboard_role_spec(mcp_mxboard_role)
-        if spec is not None:
-            mcp[spec["name"]] = {
-                "type": "remote",
-                "url": spec["url"],
-                "headers": spec["headers"],
-                "enabled": True,
-            }
+    mcp.update(additions)
 
     fd, path = tempfile.mkstemp(prefix="jarvis-opencode-", suffix=".json")
     try:
@@ -269,7 +272,7 @@ class OpenCodeEngine:
         spawn_id: str | None = None,
         system_prefix: str | None = None,
         mcp_playwright: bool = False,
-        mcp_mxboard_role: str | None = None,
+        mcp_topic_role: str | None = None,
     ) -> tuple[bool, str, str | None, str | None]:
         effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
         is_spawn = spawn_id is not None
@@ -288,7 +291,7 @@ class OpenCodeEngine:
         # opencode run не умеет per-invocation MCP, поэтому клонируем глобальный
         # конфиг (Manager MCP сохраняется) + добавляем per-topic MCP во временный
         # файл и указываем на него через OPENCODE_CONFIG.
-        pw_config_path = _opencode_mcp_config(mcp_playwright, mcp_mxboard_role)
+        pw_config_path = _opencode_mcp_config(mcp_playwright, mcp_topic_role)
 
         cmd = [
             OPENCODE_BIN, "run",

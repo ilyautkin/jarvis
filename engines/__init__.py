@@ -58,7 +58,7 @@ class Engine(Protocol):
         spawn_id: str | None = None,
         system_prefix: str | None = None,
         mcp_playwright: bool = False,
-        mcp_mxboard_role: str | None = None,
+        mcp_topic_role: str | None = None,
     ) -> tuple[bool, str, str | None, str | None]: ...
     # Возвращает (ok, final_text, session_id_after, actual_model).
     # actual_model — модель, которой CLI ответил последний раз (из stream
@@ -73,8 +73,11 @@ class Engine(Protocol):
     # mcp_playwright — если True, адаптер инъектит Playwright MCP per-invocation
     #   (claude: --mcp-config; codex: -c оверрайды; opencode: OPENCODE_CONFIG
     #   temp-файл). По умолчанию браузер НЕ грузится — это on-demand.
-    # mcp_mxboard_role — роль mxBoard MCP для текущего топика: manager topic
-    #   подключается токеном ai-manager, остальные топики — ai-agent.
+    # mcp_topic_role — роль топика ('manager' | 'agent'). Адаптер инъектит
+    #   remote MCP-серверы, объявленные для этой роли в JARVIS_TOPIC_MCP_CONFIG
+    #   (см. engines/topic_mcp.py): один форум может работать с внешним сервисом
+    #   под двумя личностями, не перемешивая их между топиками. Нет конфига —
+    #   серверов просто нет, это НЕ ошибка.
     # Будущие движки ОБЯЗАНЫ реализовать оба контракта (см. README, раздел
     # «Как подключить новый движок»).
 

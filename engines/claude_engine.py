@@ -49,12 +49,12 @@ CURRENT_MODEL: ContextVar[str | None] = ContextVar("claude_model", default=None)
 
 def _sessions_dir_for(cwd: str) -> Path:
     """~/.claude/projects/<encoded-cwd>/  (Claude CLI заменяет '/' и '.' на '-':
-    /home/shevartv/projects/visa-center.ru → -home-shevartv-projects-visa-center-ru)."""
+    /home/user/projects/visa-center.ru → -home-user-projects-visa-center-ru)."""
     encoded = re.sub(r"[/.]+", "-", cwd)
     return Path.home() / ".claude" / "projects" / encoded
 
 
-def _mcp_config_flags(mcp_playwright: bool, mcp_mxboard_role: str | None) -> list[str]:
+def _mcp_config_flags(mcp_playwright: bool, mcp_topic_role: str | None) -> list[str]:
     """``--mcp-config <inline-json>`` для per-invocation MCP-серверов.
 
     Без ``--strict-mcp-config`` — конфиг аддитивен к глобальному Manager MCP.
@@ -76,16 +76,10 @@ def _mcp_config_flags(mcp_playwright: bool, mcp_mxboard_role: str | None) -> lis
                 "args": args,
             }
 
-    if mcp_mxboard_role:
-        from engines.mxboard_mcp import mxboard_role_spec
+    if mcp_topic_role:
+        from engines.topic_mcp import claude_mcp_servers
 
-        spec = mxboard_role_spec(mcp_mxboard_role)
-        if spec is not None:
-            servers[spec["name"]] = {
-                "type": "http",
-                "url": spec["url"],
-                "headers": spec["headers"],
-            }
+        servers.update(claude_mcp_servers(mcp_topic_role))
 
     if not servers:
         return []
@@ -129,7 +123,7 @@ class PersistentClaudeWorker:
     его ``result``), не порождает новый subprocess и не ждёт лока — пишется в
     тот же stdin и подхватывается моделью сразу после текущего шага (tool-вызов
     при этом НЕ прерывается, только между шагами). Экспериментально проверено
-    2026-07-13 — см. knowledge-base/projects/jarvis/README.md.
+    2026-07-13 — см. README, раздел «Живой процесс /persistent».
     """
 
     def __init__(self, key: tuple[int, int], proc: asyncio.subprocess.Process,
@@ -252,7 +246,7 @@ async def start_persistent(
     model: str | None,
     system_prefix: str | None,
     mcp_playwright: bool,
-    mcp_mxboard_role: str | None = None,
+    mcp_topic_role: str | None = None,
 ) -> PersistentClaudeWorker:
     """Поднять живой ``claude`` под ``stream-json`` вход/выход. Флаги сессии —
     как в разовом вызове (``--resume``/``--session-id``), но выставляются
@@ -269,7 +263,7 @@ async def start_persistent(
     append_system = APPEND_SYSTEM_PROMPT
     if system_prefix:
         append_system = f"{system_prefix}\n\n{APPEND_SYSTEM_PROMPT}"
-    mcp_flags = _mcp_config_flags(mcp_playwright, mcp_mxboard_role)
+    mcp_flags = _mcp_config_flags(mcp_playwright, mcp_topic_role)
 
     cmd = [
         CLAUDE_BIN, "--print",
@@ -404,7 +398,7 @@ class ClaudeEngine:
         spawn_id: str | None = None,
         system_prefix: str | None = None,
         mcp_playwright: bool = False,
-        mcp_mxboard_role: str | None = None,
+        mcp_topic_role: str | None = None,
     ) -> tuple[bool, str, str | None, str | None]:
         # cwd берётся из аргумента (если None — caller должен подставить default).
         effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
@@ -433,7 +427,7 @@ class ClaudeEngine:
 
         # Per-topic MCP injection via --mcp-config (аддитивно к глобальному
         # Manager MCP, без --strict-mcp-config).
-        mcp_flags = _mcp_config_flags(mcp_playwright, mcp_mxboard_role)
+        mcp_flags = _mcp_config_flags(mcp_playwright, mcp_topic_role)
 
         cmd = [
             CLAUDE_BIN, "--print",

@@ -75,7 +75,7 @@ def _is_placeholder(session_id: str) -> bool:
 
 def _mcp_config_overrides(
     mcp_playwright: bool,
-    mcp_mxboard_role: str | None,
+    mcp_topic_role: str | None,
 ) -> tuple[list[str], list[Path]]:
     """Per-invocation MCP flags and temporary files.
 
@@ -102,10 +102,10 @@ def _mcp_config_overrides(
                 "-c", f"{table}.enabled=true",
             ])
 
-    if mcp_mxboard_role:
-        from engines.mxboard_mcp import create_codex_profile
+    if mcp_topic_role:
+        from engines.topic_mcp import create_codex_profile
 
-        profile = create_codex_profile(mcp_mxboard_role)
+        profile = create_codex_profile(mcp_topic_role)
         if profile is not None:
             profile_name, profile_path = profile
             flags.extend(["--profile-v2", profile_name])
@@ -115,7 +115,7 @@ def _mcp_config_overrides(
 
 
 def _cleanup_paths(paths: list[Path]) -> None:
-    from engines.mxboard_mcp import cleanup_codex_profile
+    from engines.topic_mcp import cleanup_codex_profile
 
     for path in paths:
         cleanup_codex_profile(path)
@@ -232,7 +232,7 @@ class CodexEngine:
         spawn_id: str | None = None,
         system_prefix: str | None = None,
         mcp_playwright: bool = False,
-        mcp_mxboard_role: str | None = None,
+        mcp_topic_role: str | None = None,
     ) -> tuple[bool, str, str | None, str | None]:
         effective_cwd = cwd or os.environ.get("CLAUDE_CWD", str(Path.home()))
 
@@ -269,8 +269,8 @@ class CodexEngine:
             "--dangerously-bypass-approvals-and-sandbox",
         ]
         # Per-topic MCP overrides поверх config.toml. Manager MCP остаётся
-        # глобальным, mxBoard и Playwright выбираются на конкретный запуск.
-        mcp_flags, mcp_cleanup_paths = _mcp_config_overrides(mcp_playwright, mcp_mxboard_role)
+        # глобальным, topic-MCP и Playwright выбираются на конкретный запуск.
+        mcp_flags, mcp_cleanup_paths = _mcp_config_overrides(mcp_playwright, mcp_topic_role)
         global_flags, command_mcp_flags = _split_codex_global_flags(mcp_flags)
         shared_flags.extend(command_mcp_flags)
         if is_spawn:
