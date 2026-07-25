@@ -46,10 +46,24 @@
 - Голосовые не поддерживаются.
 - Whitelist по `user_id` (см. `ALLOWED_USER_IDS`).
 
+## Требования
+
+- **Python 3.11+** (проверяется в CI на 3.11 и 3.12).
+- Хотя бы один LLM CLI, установленный и авторизованный: `claude`, `codex` или
+  `opencode`. Jarvis их не устанавливает и ключей не хранит — он вызывает то, что
+  уже работает у вас в терминале.
+- Токен бота от [@BotFather](https://t.me/BotFather) и свой Telegram user-id
+  (например через `@userinfobot`).
+
+Форум-чат не обязателен: в обычном чате бот работает одним топиком
+(`thread_id=0`). Но темы Telegram — это то, ради чего всё сделано: топик = проект
+со своим каталогом, движком и моделью.
+
 ## Установка
 
 ```bash
-cd ~/projects/jarvis
+git clone https://github.com/ShevArtV/jarvis.git
+cd jarvis
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 cp .env.example .env
@@ -62,6 +76,14 @@ cp .env.example .env
 claude --version
 claude -p "hello"   # проверка, что авторизация работает
 ```
+
+> **`.env` не перебивает окружение.** `python-dotenv` заполняет только те
+> переменные, которых в окружении ещё нет. Если `TELEGRAM_TOKEN` уже экспортирован
+> в шелле (или унаследован от родительского процесса), правка `.env` **молча ни на
+> что не влияет** — бот поднимется со старым значением. Наступали 2026-07-25:
+> тестовый клон в `/tmp` подхватил токен боевого бота и на полминуты устроил
+> обоим `409 Conflict`. Проверяйте `env | grep TELEGRAM_TOKEN`, если поведение не
+> соответствует файлу.
 
 ### Whitelist
 
@@ -260,7 +282,8 @@ Jarvis решает это ролью топика. `resolve_topic_role()` ср�
 `~/.claude.json` должны отсутствовать, иначе identity снова станет зависеть от
 конфига CLI, а не от роли топика.
 
-> **Живой пример.** [`jarvis-mxboard-poller`](../jarvis-mxboard-poller) — мост
+> **Живой пример.** [`jarvis-mxboard-poller`](https://github.com/ShevArtV/jarvis-mxboard-poller)
+> — мост
 > из канбана mxBoard: поднимает агента на событиях доски и подключает её MCP
 > обеими личностями. Он же поставляет шаблон файла выше. Jarvis о mxBoard не
 > знает ничего — вся специфика доски живёт в поллере.
