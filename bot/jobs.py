@@ -13,14 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import re
 import secrets
-import uuid
-from datetime import datetime
 
 from telegram import Update
-from telegram.error import BadRequest
 from telegram.ext import Application
 
 from engines import engine_model_scope, get_engine_by_name
@@ -36,8 +31,7 @@ from bot.delivery import (
     send_claude_reply,
     send_to_topic,
 )
-from bot.llm import build_system_prefix, call_llm_stream
-from bot.queues import finish_agent_trigger, finish_job
+from bot.llm import call_llm_stream
 from bot.sessions import (
     clear_pending_summary,
     ensure_active_session,
@@ -45,13 +39,12 @@ from bot.sessions import (
     get_pending_summary,
     get_persistent_for_engine,
     get_session,
-    mark_session_start,
-    touch_session,
 )
 from bot.settings import CLAUDE_CWD
-from bot.topics import _key, _lock_for, active_procs, resolve_manager_topic, spawn_procs
+from bot.topics import _key, _lock_for, active_procs, resolve_manager_topic
 
 logger = logging.getLogger(__name__)
+
 
 async def _run_spawn(update: Update, user_text: str) -> None:
     """Одноразовая параллельная сессия. Не использует lock топика,

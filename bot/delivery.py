@@ -14,12 +14,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
 import tempfile
-import time
 from datetime import datetime
 
 from telegram.constants import ParseMode

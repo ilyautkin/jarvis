@@ -18,7 +18,6 @@ from typing import Awaitable, Callable
 
 from engines.codex_engine import (
     CODEX_BIN,
-    CODEX_TIMEOUT,
     FILE_MARKER_SYSTEM,
     CodexEngine,
     _is_placeholder,

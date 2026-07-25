@@ -1,5 +1,7 @@
 # Jarvis
 
+[![tests](https://github.com/ShevArtV/jarvis/actions/workflows/tests.yml/badge.svg)](https://github.com/ShevArtV/jarvis/actions/workflows/tests.yml)
+
 Тонкая обёртка Telegram-бота над LLM CLI (`claude`, `codex` или `opencode`). Один топик = одна непрерывная сессия.
 Пишешь в Telegram — получаешь ответ, как если бы запускал CLI в терминале.
 
@@ -625,6 +627,12 @@ journalctl --user -u jarvis-bot -f
 
 Внешних сервисов и токенов не требуют: конфиги подкладываются во временные
 каталоги, Telegram API и запуски CLI мокаются.
+
+На каждый push и pull request то же самое прогоняет GitHub Actions
+(`.github/workflows/tests.yml`) на Python 3.11 и 3.12: юнит-тесты, `pyflakes`
+без поблажек (неиспользованный импорт тоже красит сборку) и смоук свежей
+установки — бот обязан собираться с `.env` из двух строк, без Менеджера и без
+внешних MCP-серверов.
 
 Два теста стоят особняком и страхуют структурные правки:
 

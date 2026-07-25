@@ -11,11 +11,10 @@ from __future__ import annotations
 import json
 import logging
 
-from engines import Engine, engine_model_scope, ensure_engine_tools
+from engines import Engine, ensure_engine_tools
 
 from bot.sessions import (
     get_mcp_playwright,
-    get_model,
     reset_session,
     update_actual_model,
     update_session_id,

@@ -1,0 +1,65 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# Новый push в ту же ветку отменяет предыдущий прогон: держать в очереди
+# проверку кода, который уже перезаписан, смысла нет.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      # Нужны результаты по ВСЕМ версиям: иначе падение на 3.11 скроет
+      # состояние 3.12, и придётся гадать, версия виновата или код.
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # Ни Telegram-токена, ни .env, ни установленных CLI движков здесь нет —
+      # и это часть проверки: тесты обязаны работать на чистой машине, иначе
+      # они проверяют не код, а окружение автора.
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      # Ловит имена, потерянные при переносе кода между модулями. Отдельным
+      # шагом, а не внутри тестов: NameError в теле функции не проявляется ни
+      # при импорте модуля, ни в юнит-тестах — только при вызове.
+      - name: Undefined names (pyflakes)
+        run: python -m pyflakes bot telegram_bot.py config.py webhook_server.py imap_watcher.py engines scripts
+
+      # Свежий клон обязан подниматься с .env из двух строк: без Менеджера и
+      # без внешних MCP-серверов. Регрессия здесь означает, что проект снова
+      # требует личной настройки автора, чтобы просто запуститься.
+      - name: Fresh install smoke
+        run: |
+          printf 'TELEGRAM_TOKEN=123456:fake\nALLOWED_USER_IDS=1\n' > .env
+          python - <<'PY'
+          import telegram_bot
+          from bot.app import build_application
+          from bot.db import init_db
+          from bot.topics import resolve_manager_topic
+          from engines.claude_engine import _mcp_config_flags
+
+          init_db()
+          app = build_application(token="123456:fake", allowed_user_ids={1})
+          assert len(app.handlers[0]) == 26, len(app.handlers[0])
+          assert resolve_manager_topic() is None
+          assert _mcp_config_flags(False, "agent") == []
+          print("fresh install OK:", len(app.handlers[0]), "handlers")
+          PY

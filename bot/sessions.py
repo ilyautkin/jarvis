@@ -13,14 +13,12 @@ Handoff здесь же: при смене движка контекст не п
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
-import uuid
 from datetime import datetime, timedelta, timezone
 
-from engines import SUPPORTED_ENGINES, get_engine_by_name
+from engines import get_engine_by_name
 from bot.db import _db
 from bot.settings import DEFAULT_ENGINE, DEFAULT_ENGINE_NAME, SESSION_IDLE_MINUTES
 
