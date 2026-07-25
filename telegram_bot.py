@@ -4857,33 +4857,30 @@ async def _post_init(application: Application) -> None:
     application.bot_data["imap_task"] = imap_task
 
 
-def main() -> None:
-    print(f"=== Jarvis Telegram Bot (per-topic engine, default={DEFAULT_ENGINE_NAME}) ===")
+def build_application(
+    token: str | None = None,
+    allowed_user_ids: set[int] | None = None,
+) -> Application:
+    """Собрать Application со всеми хендлерами.
 
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN не задан. См. .env.example.")
-    if not ALLOWED_USER_IDS:
-        logger.warning("ALLOWED_USER_IDS пуст — никто не сможет писать боту.")
-
-    init_db()
-    mcp_ok, mcp_status = ensure_engine_tools(DEFAULT_ENGINE)
-    if mcp_ok:
-        logger.info("Default engine tools ready: %s", mcp_status)
-    else:
-        logger.warning("Default engine tools are not fully ready: %s", mcp_status)
-
+    Вынесено из main() ради теста-снапшота регистраций: он строит приложение с
+    фейковым токеном и сверяет, что каждая команда и каждый callback-паттерн
+    по-прежнему ведут в ту же функцию. Сети не требует.
+    """
     # concurrent_updates=True: без этого PTB обрабатывает апдейты последовательно,
     # и per-key asyncio.Lock не даёт параллельности между разными топиками —
     # второй топик ждёт, пока освободится воркер PTB, а не сам lock.
     app = (
         Application.builder()
-        .token(TELEGRAM_TOKEN)
+        .token(token if token is not None else TELEGRAM_TOKEN)
         .concurrent_updates(True)
         .post_init(_post_init)
         .build()
     )
 
-    allowed = filters.User(user_id=ALLOWED_USER_IDS)
+    allowed = filters.User(
+        user_id=allowed_user_ids if allowed_user_ids is not None else ALLOWED_USER_IDS
+    )
 
     app.add_handler(CommandHandler("start", cmd_start, filters=allowed))
     app.add_handler(CommandHandler("new", cmd_reset, filters=allowed))
@@ -4913,6 +4910,26 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_done_confirm, pattern=r"^done_confirm:"))
 
     app.add_handler(MessageHandler(~allowed, unauthorized_handler))
+
+    return app
+
+
+def main() -> None:
+    print(f"=== Jarvis Telegram Bot (per-topic engine, default={DEFAULT_ENGINE_NAME}) ===")
+
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN не задан. См. .env.example.")
+    if not ALLOWED_USER_IDS:
+        logger.warning("ALLOWED_USER_IDS пуст — никто не сможет писать боту.")
+
+    init_db()
+    mcp_ok, mcp_status = ensure_engine_tools(DEFAULT_ENGINE)
+    if mcp_ok:
+        logger.info("Default engine tools ready: %s", mcp_status)
+    else:
+        logger.warning("Default engine tools are not fully ready: %s", mcp_status)
+
+    app = build_application()
 
     logger.info("Whitelisted user_ids: %s", sorted(ALLOWED_USER_IDS))
     logger.info("Default engine: %s  default cwd=%s", DEFAULT_ENGINE_NAME, CLAUDE_CWD)
