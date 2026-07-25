@@ -9,7 +9,6 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-import telegram_bot
 from bot import db as bot_db
 
 
@@ -55,7 +54,7 @@ class AskUserExternalGuardTest(unittest.TestCase):
     def _fresh_db(self, tmp: str) -> str:
         db_path = str(Path(tmp) / "bot_state.db")
         with patch.object(bot_db, "DB_PATH", db_path):
-            telegram_bot.init_db()
+            bot_db.init_db()
         return db_path
 
     def _add_trigger(
@@ -76,7 +75,7 @@ class AskUserExternalGuardTest(unittest.TestCase):
             with sqlite3.connect(db_path) as conn:
                 conn.execute(OLD_TRIGGERS_SCHEMA)
             with patch.object(bot_db, "DB_PATH", db_path):
-                telegram_bot.init_db()
+                bot_db.init_db()
             with sqlite3.connect(db_path) as conn:
                 cols = [r[1] for r in conn.execute(
                     "PRAGMA table_info(agent_triggers)"

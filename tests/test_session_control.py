@@ -14,7 +14,8 @@ from unittest.mock import AsyncMock, patch
 
 from engines.session_usage import aggregate_claude_usage
 from bot import db as bot_db
-from telegram_bot import (
+from bot import workers as bot_workers
+from bot.handlers.toggles import (
     _done_confirm_keyboard,
     _looks_like_task_done,
     _looks_like_waiting_for_user,
@@ -187,13 +188,11 @@ class ManagerCloseSessionTest(unittest.TestCase):
             )
 
     def test_close_request_flows_from_mcp_to_bot(self) -> None:
-        import telegram_bot
-
         mcp_server = _load_mcp_server()
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "bot_state.db")
             with patch.object(bot_db, "DB_PATH", db_path):
-                telegram_bot.init_db()
+                bot_db.init_db()
                 self._seed(db_path)
 
                 mcp_server._DB_PATH = Path(db_path)
@@ -224,9 +223,9 @@ class ManagerCloseSessionTest(unittest.TestCase):
                 app = _FakeApp(chat)
                 key = (self.CHAT_ID, self.THREAD_ID)
                 with patch.object(
-                    telegram_bot, "_kill_persistent_worker", new=AsyncMock(return_value=True)
+                    bot_workers, "_kill_persistent_worker", new=AsyncMock(return_value=True)
                 ) as kill:
-                    asyncio.run(telegram_bot._apply_close_request(app, key))
+                    asyncio.run(bot_workers._apply_close_request(app, key))
                 kill.assert_awaited_once()
                 self.assertEqual(kill.await_args.args[0], key)
 
@@ -256,13 +255,11 @@ class ManagerCloseSessionTest(unittest.TestCase):
                 self.assertEqual(repeat["interrupted_jobs"], [])
 
     def test_unknown_topic_is_rejected(self) -> None:
-        import telegram_bot
-
         mcp_server = _load_mcp_server()
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "bot_state.db")
             with patch.object(bot_db, "DB_PATH", db_path):
-                telegram_bot.init_db()
+                bot_db.init_db()
             mcp_server._DB_PATH = Path(db_path)
             with self.assertRaises(RuntimeError):
                 mcp_server.manager_close_session(thread_id=1, chat_id=self.CHAT_ID)

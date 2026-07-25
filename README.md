@@ -578,39 +578,44 @@ journalctl --user -u jarvis-bot -f
 
 ## Файлы
 
-- `telegram_bot.py` — весь бот: команды, воркеры, схема БД, роутинг сообщений.
+`telegram_bot.py` — точка входа (~60 строк). Весь код живёт в пакете `bot/`;
+до 2026-07-25 это был один файл на 4924 строки.
+
+Слои — строго вниз, без циклов: `settings` → `db` → `queues`/`topics` →
+`sessions` → `delivery` → `llm` → `handlers` → `jobs`/`workers` → `app`.
+
+| Модуль | Что внутри |
+|---|---|
+| `bot/settings.py` | env и константы; ничего не импортирует из `bot.*` |
+| `bot/db.py` | схема SQLite, идемпотентные миграции, `log_message`. `DB_PATH` здесь — единственное, что решает, с каким файлом работает бот |
+| `bot/queues.py` | `jobs` и `agent_triggers`: атомарный claim/finish, уборка старых записей |
+| `bot/topics.py` | топик как единица работы: ключ, роль, реестры локов/процессов/живых воркеров |
+| `bot/sessions.py` | сеансы, флаги топика, handoff при смене движка |
+| `bot/asks.py` | `ask_user` — вопрос агента и приём ответа |
+| `bot/formatting.py` | Markdown → HTML Telegram, нарезка по лимиту |
+| `bot/delivery.py` | отправка, журнал хода, длинные ответы файлом, маркеры `[[FILE:]]` |
+| `bot/llm.py` | системный префикс и `call_llm_stream` |
+| `bot/reminders.py` | разбор расписаний; без зависимостей на Telegram — импортируется MCP-сервером |
+| `bot/handlers/commands.py` | простые команды: `/start`, `/session`, `/bind`, … |
+| `bot/handlers/engine.py` | `/engine` и его инлайн-диалог выбора движка и модели |
+| `bot/handlers/toggles.py` | `/browser`, `/persistent`, вопрос «задача завершена?» |
+| `bot/handlers/messages.py` | текст, фото, документы; обычный ход и ход через живой процесс |
+| `bot/jobs.py` | выполнение job Менеджера, `/spawn`, внешних триггеров |
+| `bot/workers.py` | все фоновые циклы: heartbeat, очереди, reaper, напоминания, уборка |
+| `bot/app.py` | сборка `Application`, регистрация хендлеров, старт воркеров |
+
+Прочее:
+
 - `config.py` — чтение `.env`, токен и whitelist.
-- `requirements.txt` — зависимости (`python-telegram-bot`, `python-dotenv`, `mcp`).
 - `webhook_server.py` — HTTP-приём внешних уведомлений.
 - `imap_watcher.py` — вотчер почты (см. `JARVIS_IMAP_*`).
-
-Движки (`engines/`):
-
-- `__init__.py` — протокол `Engine`, реестр движков, `engine_model_scope()`.
-- `claude_engine.py`, `codex_engine.py`, `opencode_engine.py` — адаптеры CLI.
-- `persistent_codex.py` — живой Codex app-server для `/persistent`.
-- `playwright_mcp.py` — runtime-настройка Playwright MCP для активного движка.
-- `topic_mcp.py` — внешние MCP-серверы по роли топика.
-- `jarvis_mcp.py` — регистрация Jarvis Manager MCP в конфигах движков.
-- `model_cache.py` — TTL-кэш списков моделей (движки спрашивают их у своих CLI,
-  а не хардкодят).
-- `session_usage.py` — оценка размера сессии для `/tokens`.
-- `process_control.py` — снятие дерева процессов движка.
-
-Скрипты (`scripts/`):
-
-- `jarvis_mcp_server.py` — сам Jarvis Manager MCP (`ask_user`, `manager_*`).
-- `session_tokens.py` — CLI-отчёт по расходу токенов.
-- `sync_codex_knowledge.py` — личная утилита автора (синк базы знаний в
-  `AGENTS.md`); для установки Jarvis не нужна.
-
-Состояние и прочее:
-
-- `bot_state.db` — sqlite: сессии топиков, `jobs`, `agent_triggers`,
-  `messages_log`, `reminders`, метаданные исходящих сообщений (для reply-to).
+- `engines/` — адаптеры CLI, Playwright MCP, topic-MCP, кэш моделей (см. выше).
+- `scripts/jarvis_mcp_server.py` — Jarvis Manager MCP (`ask_user`, `manager_*`).
+- `scripts/sync_codex_knowledge.py` — личная утилита автора; для установки не нужна.
+- `bot_state.db` — sqlite: сессии, `jobs`, `agent_triggers`, `messages_log`,
+  `reminders`, метаданные исходящих сообщений (для reply-to).
 - `temp/media/` — скачанные пользовательские вложения.
 - `systemd/jarvis-bot.service` — user-unit.
-- `tests/` — юнит-тесты, запуск: `./venv/bin/python -m unittest discover -s tests`.
 
 ## Тесты
 

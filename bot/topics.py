@@ -20,6 +20,8 @@ from datetime import datetime
 
 from telegram import Update
 
+from engines.process_control import terminate_process_tree
+
 from bot.db import _db
 from bot.settings import int_env
 
@@ -132,3 +134,23 @@ def _lock_for(key: tuple[int, int]) -> asyncio.Lock:
 # Когда запрос уже начал выполняться (lock захвачен) — его id удаляется из реестра;
 # попытка отменить в этот момент отвечает пользователю «используй /stop».
 pending_queue: dict[str, asyncio.Event] = {}
+
+
+async def _kill_persistent_worker(key: tuple[int, int], reason: str) -> bool:
+    """Убить живой процесс топика, если есть. Будит того, кто ждёт
+    результата текущего хода (не вешает его до CLAUDE_TIMEOUT). Возвращает
+    True, если воркер был и его убили."""
+    worker = persistent_workers.pop(key, None)
+    if worker is None:
+        return False
+    logger.info("killing persistent worker key=%s reason=%s", key, reason)
+    worker.dead = True
+    if worker.pending_future is not None and not worker.pending_future.done():
+        worker.pending_future.set_result((False, reason))
+    if worker.reader_task is not None:
+        worker.reader_task.cancel()
+    stderr_task = getattr(worker, "stderr_task", None)
+    if stderr_task is not None:
+        stderr_task.cancel()
+    await terminate_process_tree(worker.proc)
+    return True
