@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import telegram_bot
+from bot import db as bot_db
 
 
 OLD_TRIGGERS_SCHEMA = """
@@ -53,7 +54,7 @@ class AskUserExternalGuardTest(unittest.TestCase):
 
     def _fresh_db(self, tmp: str) -> str:
         db_path = str(Path(tmp) / "bot_state.db")
-        with patch.object(telegram_bot, "DB_PATH", db_path):
+        with patch.object(bot_db, "DB_PATH", db_path):
             telegram_bot.init_db()
         return db_path
 
@@ -74,7 +75,7 @@ class AskUserExternalGuardTest(unittest.TestCase):
             db_path = str(Path(tmp) / "old.db")
             with sqlite3.connect(db_path) as conn:
                 conn.execute(OLD_TRIGGERS_SCHEMA)
-            with patch.object(telegram_bot, "DB_PATH", db_path):
+            with patch.object(bot_db, "DB_PATH", db_path):
                 telegram_bot.init_db()
             with sqlite3.connect(db_path) as conn:
                 cols = [r[1] for r in conn.execute(

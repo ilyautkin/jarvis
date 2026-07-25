@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from engines.session_usage import aggregate_claude_usage
+from bot import db as bot_db
 from telegram_bot import (
     _done_confirm_keyboard,
     _looks_like_task_done,
@@ -191,7 +192,7 @@ class ManagerCloseSessionTest(unittest.TestCase):
         mcp_server = _load_mcp_server()
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "bot_state.db")
-            with patch.object(telegram_bot, "DB_PATH", db_path):
+            with patch.object(bot_db, "DB_PATH", db_path):
                 telegram_bot.init_db()
                 self._seed(db_path)
 
@@ -260,7 +261,7 @@ class ManagerCloseSessionTest(unittest.TestCase):
         mcp_server = _load_mcp_server()
         with tempfile.TemporaryDirectory() as tmp:
             db_path = str(Path(tmp) / "bot_state.db")
-            with patch.object(telegram_bot, "DB_PATH", db_path):
+            with patch.object(bot_db, "DB_PATH", db_path):
                 telegram_bot.init_db()
             mcp_server._DB_PATH = Path(db_path)
             with self.assertRaises(RuntimeError):
