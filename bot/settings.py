@@ -70,6 +70,13 @@ def configure_logging() -> None:
         format="[bot] %(asctime)s %(levelname)s %(message)s",
         level=logging.INFO,
     )
+    # httpx пишет на INFO полный URL каждого запроса, а токен бота — часть пути
+    # к api.telegram.org. На INFO это укладывает токен в journald открытым
+    # текстом в каждой строке: права на .env тогда защищают меньше, чем кажется
+    # (лог читает любой, у кого есть доступ к journalctl). WARNING оставляет
+    # видимыми ошибки транспорта и убирает поток URL'ов.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 configure_logging()
